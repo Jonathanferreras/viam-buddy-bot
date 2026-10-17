@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { getLogs, cap, isGeneric } from "./api.js";
+import { getLogs, cap, isGeneric, tagOf } from "./api.js";
 import { useLocal } from "./hooks.js";
 import { Close } from "./icons.jsx";
 import { roleFor, wakeWord } from "./roles.js";
 
-const EXAMPLES = ["pick up the white cup", "get the red ball", "grab the yellow one", "hand me the cup", "drop it", "put it down",
+const EXAMPLES = ["pick up the white cup", "grab white cup 2", "get the red ball", "grab the yellow one", "hand me the cup", "drop it", "put it down",
                   "go back to the start", "reset arm 17", "wave arm 18", "let’s play shell game", "stop"];
 
 // ---- what you can say ----
@@ -12,7 +12,7 @@ export function CommandsDrawer({ st, onClose }) {
   const arms = st.arms || [];
   const toggle = (st.mic && st.mic.mode) === "toggle";
   const cam = (st.cams || []).find((c) => c.arm && (c.objects || []).some((o) => o.grab && o.grab.arm));
-  const seen = cam ? [...new Set(cam.objects.filter((o) => o.grab && o.grab.arm && !isGeneric(o.label)).map((o) => o.label.toLowerCase()))].slice(0, 10) : [];
+  const seen = cam ? [...new Set(cam.objects.filter((o) => o.grab && o.grab.arm && !isGeneric(tagOf(o))).map((o) => tagOf(o).toLowerCase()))].slice(0, 10) : [];
   const who = cam ? (arms.find((a) => a.name === cam.arm) ? roleFor(arms.find((a) => a.name === cam.arm), arms).role : cap(cam.arm)) : "";
   return (
     <aside className="drawer" aria-label="What you can say">

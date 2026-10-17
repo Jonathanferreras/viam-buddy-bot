@@ -152,7 +152,7 @@ export default function DeskView({ st, busy, bump, onNotice }) {
       <button key={t.key} type="button" className={`tile${generic ? " tile--generic" : ""}${t.seen ? "" : " gone"}${target ? " target" : ""}`}
         aria-pressed={t.key === selKey} title={tip} aria-label={tip}
         onClick={() => pick(t.key)} onPointerEnter={() => setHovKey(t.key)} onPointerLeave={() => setHovKey(null)}>
-        <span className="tile__top"><span className="tile__sw" style={{ background: t.swatch || "var(--fill2)" }} />{t.label}</span>
+        <span className="tile__top"><span className="tile__sw" style={{ background: t.swatch || "var(--fill2)" }} />{t.base}{t.n && <span className="tile__n">#{t.n}</span>}</span>
         <span className="tile__st">{target ? "Grabbing now" : [shortSize(o), fmtDist(o.dist_mm)].filter(Boolean).join(" · ")}</span>
       </button>
     );
@@ -217,7 +217,7 @@ export default function DeskView({ st, busy, bump, onNotice }) {
         <div className="sh sh--tight">
           <div className="sh__inline">
             <h3>Within reach</h3>
-            <span className="sh__sub">{cur ? "Going for the highlighted one" : "Just say “grab the …” and name one"}</span>
+            <span className="sh__sub">{cur ? "Going for the highlighted one" : tracks.some((t) => t.n) ? "Several of a kind are numbered left to right — say “grab the white cup 2”" : "Just say “grab the …” and name one"}</span>
           </div>
           <span className="aux" title={nm && nm.detail ? nm.detail : ""}>{[seenN ? `${seenN} ${seenN === 1 ? "item" : "items"}` : "", nmTxt].filter(Boolean).join(" · ")}</span>
         </div>
@@ -233,7 +233,7 @@ export default function DeskView({ st, busy, bump, onNotice }) {
             )}
             {unnamed.length > 0 && (
               <>
-                <div className="group"><i className="group__dot group__dot--warn" /><span className="group__name">Unidentified</span><span className="group__sub">{unnamed.length} · Still reachable — tap one, then Grab</span></div>
+                <div className="group"><i className="group__dot group__dot--warn" /><span className="group__name">Unidentified</span><span className="group__sub">{unnamed.length} · Still reachable — say “grab the {unnamed[0].label.toLowerCase()}” or tap one, then Grab</span></div>
                 <div className="objgrid" role="list">{unnamed.map((t) => tile(t, true))}</div>
               </>
             )}

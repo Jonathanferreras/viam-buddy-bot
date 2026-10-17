@@ -171,14 +171,36 @@ _NOUNS = {
     "screwdriver": {"screwdriver"}, "driver": {"screwdriver"}, "fruit": {"fruit"}, "apple": {"fruit"},
     "banana": {"fruit"}, "bowl": {"bowl"}, "mouse": {"mouse"}, "notebook": {"notebook"}, "book": {"notebook"},
     "glasses": {"glasses"}, "headphones": {"headphones"},
+    "object": {"object"},   # the camera's name for something it couldn't identify ("White object 2")
 }
 _NUMBERS = {w: str(i) for i, w in enumerate(
     "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
     "seventeen eighteen nineteen twenty".split())}
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6}
 # extra words the speech recognizer may hear (it only knows the words it's given), in any order
 _NLU_WORDS = sorted({w for _, ws in _INTENTS for p in ws for w in p.split()} | set(_COLORS) | set(_NOUNS)
+                    | set(_ORDINALS) | {"two", "three", "four", "five", "six", "number"}
                     | {"the", "a", "an", "arm", "please", "can", "you", "me", "up", "it", "that", "this", "to",
                        "your", "and", "now", "go", "thing", "one", "seventeen", "eighteen", "hey", "viam"})
+
+
+def _number_duplicates(objs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """When a camera sees several things with the same name, number them left to right as they appear
+    in its picture: each gets "n" (1-based), "count", and "tag" -- the name to show and say ("White cup 2").
+    A one-of-a-kind thing's tag is just its name."""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for o in objs:
+        groups.setdefault((o.get("label") or "").lower(), []).append(o)
+    out = []
+    for o in objs:
+        same = groups[(o.get("label") or "").lower()]
+        if len(same) < 2:
+            out.append({**o, "n": 1, "count": 1, "tag": o.get("label")})
+            continue
+        ordered = sorted(same, key=lambda x: ((x.get("uv") or [0, 0])[0], x.get("id", 0)))
+        n = ordered.index(o) + 1
+        out.append({**o, "n": n, "count": len(same), "tag": f"{o.get('label')} {n}"})
+    return out
 
 
 def _friendly_error(e: BaseException) -> str:
@@ -887,9 +909,9 @@ class VoiceRouter(Generic, EasyResource):
     def _live_with_grab_info(self, c: Dict[str, Any]) -> Dict[str, Any]:
         """One camera's live status, with each object marked with the arm that would grab it (or why none can)."""
         lv = {**status_page.live_status(c["camera"]), "name": c["camera"], "label": c["label"], "arm": c["arm_label"]}
-        objs = lv.get("objects") or []
+        objs = _number_duplicates(lv.get("objects") or [])
         if not objs or not self.grabbers:
-            return lv
+            return {**lv, "objects": objs}
         out = []
         for o in objs:
             try:
@@ -1282,10 +1304,22 @@ class VoiceRouter(Generic, EasyResource):
         color = next((w for w in words if w in _COLORS), None)
         color = "gray" if color == "grey" else color
         noun = next((w for w in reversed(words) if w in _NOUNS), None)   # the last one: "can you get the cup"
+        # which one, when there are several: "white cup 2", "cup number two", "the second cup"
+        which = None
+        if noun:
+            i = max(i for i, w in enumerate(words) if w in _NOUNS)
+            for j in range(i + 1, len(words)):
+                if words[j].isdigit() and words[j - 1] != "arm":
+                    which = int(words[j])
+                    break
+        if which is None:
+            which = next((_ORDINALS[w] for w in words if w in _ORDINALS), None)
         what = " ".join(x for x in (color, noun) if x) or "thing"
+        shown = f"{what} {which}" if which else what
         g = self.grabbers[self.picker]
         return self._mk_cmd(action="find_grab", resource_name=self.picker, name=g["name"], color=color, noun=noun,
-                            what=what, label=f"Grabbing the {what}" if what != "thing" else "Grabbing something")
+                            which=which, what=shown,
+                            label=f"Grabbing the {shown}" if what != "thing" else "Grabbing something")
 
     def _record(self, **entry):
         self._history.append({"time": time.time(), **entry})
@@ -1770,11 +1804,22 @@ class VoiceRouter(Generic, EasyResource):
         return list(status_page.live_status(name).get("objects") or [])
 
     def _pick_object(self, objs: List[Dict[str, Any]], c: Dict[str, Any], color: Optional[str],
-                     noun: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+                     noun: Optional[str], which: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """The seen object that best fits "red ball": the color must match; the kind should (a thing the
-        camera hasn't named yet still counts, one it named as something else counts less)."""
+        camera hasn't named yet still counts, one it named as something else counts less). With `which`,
+        only the object numbered that way among its namesakes ("white cup 2") counts."""
         nouns = _NOUNS.get(noun, {noun}) if noun else set()
+        objs = _number_duplicates(objs)
         scored, refused = [], None
+        if which is not None:
+            fitting = [o for o in objs if (not color or color == (o.get("block") or o.get("color") or "").lower()
+                                              or color in (o.get("label") or "").lower().split())
+                       and (not nouns or (o.get("kind") or "").lower() in nouns
+                            or any(n in (o.get("label") or "").lower().split() for n in nouns))]
+            if fitting and not any(o.get("n") == which for o in fitting):
+                most = max(o.get("count", 1) for o in fitting)
+                return None, f"only see {most} of those, not a number {which}"
+            objs = [o for o in objs if o.get("n") == which]
         for o in objs:
             label = (o.get("label") or "").lower()
             kind = (o.get("kind") or "").lower()
@@ -1811,7 +1856,7 @@ class VoiceRouter(Generic, EasyResource):
             raise ValueError("no arm with its own camera is set to pick things up (vision.picker)")
         g = self.grabbers[c["arm"]]
         name = _cap(g["name"])
-        color, noun = cmd.get("color"), cmd.get("noun")
+        color, noun, which = cmd.get("color"), cmd.get("noun"), cmd.get("which")
         if not color and not noun:
             raise NotFound("Tell me what to grab, like “grab the red ball”")
         await self._sync_holding(g)
@@ -1820,8 +1865,20 @@ class VoiceRouter(Generic, EasyResource):
         what = cmd.get("what") or " ".join(x for x in (color, noun) if x)
         self._action_arms = [g["key"]]
         self._set_phase("running", current=f"{name} is looking for the {what}")
+        if which is not None:
+            # "white cup 2": the numbers are the ones the page shows, counted left to right in the desk
+            # camera's picture, so look there (and let its calibration pick the arm), not through the wrist
+            desk = next((d for d in self.live_cams if not d.get("arm") and d["cam"] is not None), None)
+            if desk is not None:
+                objs = await self._fresh_objects(desk)
+                best, why = self._pick_object(objs, desk, color, noun, which)
+                if best is None:
+                    raise NotFound(_cap(why or f"I can't see a {what} on the desk"))
+                tag = (best.get("tag") or best["label"])
+                LOGGER.info(f"“{what}” -> the {tag.lower()} in {desk['label']}")
+                return await self._grab_seen(best, desk, tag[:1].lower() + tag[1:])
         objs = await self._fresh_objects(c)
-        best, why = self._pick_object(objs, c, color, noun)
+        best, why = self._pick_object(objs, c, color, noun, which)
         if best is None:
             if color and noun in (None, "block") and not why:   # nothing named: a plain color search
                 return await self._grab_with_wrist(c, color)
@@ -1829,10 +1886,33 @@ class VoiceRouter(Generic, EasyResource):
         p, why = self._wrist_point(best, c)
         if p is None:
             raise ValueError(why)
-        label = best["label"][:1].lower() + best["label"][1:]
+        tag = best.get("tag") or best["label"]
+        label = tag[:1].lower() + tag[1:]
         LOGGER.info(f"“{what}” -> the {label} that {g['name']} sees")
         return await self._pick_at(g, p, label, float((best.get("size_mm") or [0, 0, 0])[2] or 0),
                                    self._wrist_extras(best, c))
+
+    async def _grab_seen(self, obj: Dict[str, Any], c: Dict[str, Any], what: str) -> Dict[str, Any]:
+        """Pick up `obj` as camera `c` sees it: from the desk camera the closest calibrated arm goes,
+        from a wrist camera the arm it's mounted on. Runs inside the current action."""
+        info = self._object_grab_info(obj, c)
+        if not info:
+            raise ValueError("grabbing isn't set up for this camera")
+        if "why" in info:
+            raise NotFound(_cap(f"saw the {what}, but {info['why']}"))
+        g = self.grabbers[info["key"]]
+        await self._sync_holding(g)
+        if g["holding"]:
+            raise ValueError(f"{_cap(g['name'])} is already holding the {g['holding']} — say “let go” first")
+        self._action_arms = [g["key"]]
+        self._set_phase("running", current=f"{_cap(g['name'])} is reaching for the {what}")
+        if info.get("via") == "wrist":
+            p, why = self._wrist_point(obj, c)
+            if p is None:
+                raise ValueError(why)
+            return await self._pick_at(g, p, what, float((obj.get("size_mm") or [0, 0, 0])[2] or 0),
+                                       self._wrist_extras(obj, c))
+        return await self._pick(g, self._object_cam_mm(obj, c), what)
 
     async def _grab_with_wrist(self, c: Dict[str, Any], color: str) -> Dict[str, Any]:
         g = self.grabbers[c["arm"]]
@@ -1870,7 +1950,8 @@ class VoiceRouter(Generic, EasyResource):
         for c in self.live_cams:
             if cam_name and c["camera"] != cam_name:
                 continue
-            obj = next((o for o in (status_page.live_status(c["camera"]).get("objects") or []) if o.get("id") == oid), None)
+            obj = next((o for o in _number_duplicates(status_page.live_status(c["camera"]).get("objects") or [])
+                        if o.get("id") == oid), None)
             if obj is not None:
                 found = (c, obj)
                 break
@@ -1886,7 +1967,8 @@ class VoiceRouter(Generic, EasyResource):
         if "why" in info:
             raise ValueError(info["why"])
         g = self.grabbers[info["key"]]
-        what = obj["label"][:1].lower() + obj["label"][1:]   # "red block", "white cup"
+        tag = obj.get("tag") or obj["label"]
+        what = tag[:1].lower() + tag[1:]   # "red block", "white cup 2"
         if info.get("via") == "wrist":
             p, _ = self._wrist_point(obj, c)
             height = float((obj.get("size_mm") or [0, 0, 0])[2] or 0)

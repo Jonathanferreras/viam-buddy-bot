@@ -49,4 +49,6 @@ export function longSize(o) {
 }
 export const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 export const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : "");
-export const isGeneric = (label) => /\bobject$/i.test(label || "");
+export const isGeneric = (label) => /\bobject( \d+)?$/i.test(label || "");
+// The name to show and say for a detection: numbered when the camera sees several of a kind ("White cup 2").
+export const tagOf = (o) => o.tag || o.label || "";

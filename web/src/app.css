@@ -219,7 +219,7 @@ button.orb__btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 4
 .group__dot--ok { background: var(--green); } .group__dot--warn { background: var(--orange); }
 .group__name { font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .group__sub { font-size: 13px; color: var(--ink2); }
-.objgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.objgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(164px, 1fr)); gap: 10px; }
 .tile { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 12px 14px; border-radius: var(--r-tile); border: 1px solid transparent; background: var(--surface); text-align: left; transition: box-shadow .15s, opacity .3s, background .15s; }
 .tile:hover { background: var(--surface2); }
 .tile[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--accent) inset; }
@@ -227,8 +227,9 @@ button.orb__btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 4
 .tile.target .tile__st { color: var(--green); font-weight: 600; }
 .tile.gone { opacity: .45; }
 .tile--generic { border-color: rgba(161,161,166,.45); border-style: dashed; }
-.tile__top { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; }
+.tile__top { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; white-space: nowrap; }
 .tile__sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.tile__n { margin-left: 2px; padding: 1px 7px; border-radius: 999px; background: var(--fill2); font-size: 12px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
 .tile__st { font-size: 13px; color: var(--ink2); }
 
 /* ---- drawers (commands, logs) ---- */

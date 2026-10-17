@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { getState, sleep, isGeneric } from "./api.js";
+import { getState, sleep, isGeneric, tagOf } from "./api.js";
 
 // ---- /state, polled four times a second ----
 export function useRouterState() {
@@ -144,10 +144,10 @@ export function useTracks(objects, fps) {
       if (used.has(o) || !free.has(t)) continue;
       used.add(o); free.delete(t);
       t.obj = o; t.lastSeen = now; t.hits++;
-      t.labels.push([o.label, o.swatch || ""]); if (t.labels.length > LABEL_WINDOW) t.labels.shift();
+      t.labels.push([tagOf(o), o.swatch || ""]); if (t.labels.length > LABEL_WINDOW) t.labels.shift();
     }
     for (const o of objs) if (!used.has(o))
-      tr.list.push({ key: ++tr.seq, obj: o, firstSeen: now, lastSeen: now, hits: 1, labels: [[o.label, o.swatch || ""]], order: o.uv[0] });
+      tr.list.push({ key: ++tr.seq, obj: o, firstSeen: now, lastSeen: now, hits: 1, labels: [[tagOf(o), o.swatch || ""]], order: o.uv[0] });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [objects]);
   const tr = TR.current;
@@ -156,7 +156,9 @@ export function useTracks(objects, fps) {
     .filter((t) => t.hits >= SHOW_AFTER_HITS)
     .map((t) => {
       const [label, swatch] = mode(t.labels.map((x) => x.join("\u0000"))).split("\u0000");
-      return { key: t.key, obj: t.obj, label, swatch, order: t.order, seen: now - t.lastSeen <= staleMs, named: !isGeneric(label) };
+      const m = label.match(/^(.*) (\d+)$/); // "White cup 2" -> base "White cup", n 2
+      return { key: t.key, obj: t.obj, label, base: m ? m[1] : label, n: m ? +m[2] : null, swatch, order: t.order,
+               seen: now - t.lastSeen <= staleMs, named: !isGeneric(label) };
     })
     .sort((a, b) => (b.named - a.named) || a.order - b.order || a.key - b.key);
   return shown;
