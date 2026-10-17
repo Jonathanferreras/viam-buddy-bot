@@ -25,8 +25,10 @@ h3 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
 .top__mark { width: 34px; height: 34px; border-radius: 10px; background: var(--accent); display: grid; place-items: center; flex: none; }
 .top__name { font-size: 20px; font-weight: 700; letter-spacing: -.02em; white-space: nowrap; }
 .top__div { width: 1px; height: 22px; background: rgba(84,84,88,.8); }
-.top__by { font-size: 15px; color: var(--ink2); white-space: nowrap; }
-.top__by b { font-weight: 700; letter-spacing: .14em; color: var(--ink); font-size: 14px; margin-left: 2px; }
+.top__by { font-size: 15px; color: var(--ink2); white-space: nowrap; display: inline-flex; align-items: center; gap: 8px; }
+/* Viam wordmark (web/public/viam-wordmark.png, 365×72): a transparent mask tinted with the text color */
+.wordmark { display: inline-block; width: calc(16px * 5.07); height: 16px; background: var(--ink);
+  -webkit-mask: url("/viam-wordmark.png") center / contain no-repeat; mask: url("/viam-wordmark.png") center / contain no-repeat; }
 .top__right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
 .conn { padding: 10px 28px; background: rgba(255,69,58,.14); color: var(--ink); font-size: 14px; }
 

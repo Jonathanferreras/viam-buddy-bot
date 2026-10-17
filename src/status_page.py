@@ -242,10 +242,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_file(built, "text/html; charset=utf-8")
             else:
                 self._send(200, "text/html; charset=utf-8", PAGE)
-        elif self.path.startswith("/assets/"):
-            built = _dist_file(urlparse(self.path).path.lstrip("/"))
+        elif self.path.startswith("/assets/") or os.path.splitext(urlparse(self.path).path)[1].lower() in _MIME:
+            # the built page's files: hashed bundles under /assets/, plus root files like /viam-wordmark.png
+            rel = urlparse(self.path).path.lstrip("/")
+            built = _dist_file(rel)
             if built:
-                self._send_file(built, _MIME.get(os.path.splitext(built)[1].lower(), "application/octet-stream"), cache=True)
+                self._send_file(built, _MIME.get(os.path.splitext(built)[1].lower(), "application/octet-stream"), cache=rel.startswith("assets/"))
             else:
                 self._send(404, "text/plain", "not found")
         else:

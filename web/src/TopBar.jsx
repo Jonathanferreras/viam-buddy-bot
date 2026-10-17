@@ -36,7 +36,7 @@ export default function TopBar({ st, online, drawer, setDrawer, logUnseen }) {
         <span className="top__mark"><Logo /></span>
         <span className="top__name">Buddy Bot</span>
         <span className="top__div" />
-        <span className="top__by">built on <b>VIAM</b></span>
+        <span className="top__by">built on <span className="wordmark" role="img" aria-label="Viam" /></span>
       </div>
       <div className="top__right">
         <RecPill recs={recs} />
