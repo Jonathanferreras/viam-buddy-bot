@@ -2,7 +2,7 @@
 // and grabs things for you); the second is the Player (it runs the games). Extra arms keep their
 // own names. A camera mounted on an arm is listed under that arm's role in the camera picker.
 const ROLES = [
-  { role: "Helper", blurb: "Reaches and grabs things for you" },
+  { role: "Helper", blurb: "Grabs things for you" },
   { role: "Player", blurb: "Plays games with you" },
 ];
 
