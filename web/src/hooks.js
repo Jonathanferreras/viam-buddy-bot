@@ -113,8 +113,15 @@ export function useFlow(state) {
 // The detector runs ~5x a second and is noisy: the same cup can come back with a new id, flip between
 // "White object" and "Gray object", or drop out for a frame. Each detection is matched to the nearest
 // existing track; a track only appears once it's been seen twice, shows its most common recent label,
-// and fades for a moment before it's removed. Named things come first, generic "… object"s after.
+// and fades for a moment before it's removed.
+//
+// Ordering is meant to be calm. A track that has been seen steadily under one name for a few seconds
+// becomes ESTABLISHED: from then on its label only changes if the detector is unanimous about a new one,
+// and its place in the grid is fixed by the moment it was established, so the things Buddy is surest
+// about sit top-left in a stable order. Tracks still settling follow, sorted by how sure we are, and
+// those are the only tiles that move around.
 const SHOW_AFTER_HITS = 2, STALE_MS = 700, KEEP_MS = 1800, MATCH_PX = 40, LABEL_WINDOW = 8;
+const ESTABLISH_HITS = 16, ESTABLISH_AGREE = 0.75;   // ~4 s of polls, ≥ 3/4 of recent names agreeing
 export function mode(arr) {
   const n = new Map(); let best = arr[arr.length - 1], bn = 0;
   for (const v of arr) { const c = (n.get(v) || 0) + 1; n.set(v, c); if (c >= bn) { bn = c; best = v; } }
@@ -155,12 +162,30 @@ export function useTracks(objects, fps) {
   const shown = tr.list
     .filter((t) => t.hits >= SHOW_AFTER_HITS)
     .map((t) => {
-      const [label, swatch] = mode(t.labels.map((x) => x.join("\u0000"))).split("\u0000");
+      const joined = t.labels.map((x) => x.join("\u0000"));
+      const best = mode(joined);
+      const agree = joined.filter((x) => x === best).length / joined.length;
+      if (!t.estAt && t.hits >= ESTABLISH_HITS && agree >= ESTABLISH_AGREE && t.labels.length >= LABEL_WINDOW) {
+        t.estAt = now; t.shown = best;             // settled: this name and this slot stick
+      }
+      if (t.estAt) {
+        if (agree === 1 && best !== t.shown) t.shown = best;   // only a unanimous new name changes it
+      } else {
+        t.shown = best;
+      }
+      const [label, swatch] = t.shown.split("\u0000");
       const m = label.match(/^(.*) (\d+)$/); // "White cup 2" -> base "White cup", n 2
       return { key: t.key, obj: t.obj, label, base: m ? m[1] : label, n: m ? +m[2] : null, swatch, order: t.order,
-               seen: now - t.lastSeen <= staleMs, named: !isGeneric(label) };
+               seen: now - t.lastSeen <= staleMs, named: !isGeneric(label),
+               estAt: t.estAt || 0,
+               // confidence in tenths, so two unsettled tiles don't trade places over a rounding difference
+               sure: Math.round((Math.min(t.hits, ESTABLISH_HITS) / ESTABLISH_HITS * 0.6 + agree * 0.4) * 10) };
     })
-    .sort((a, b) => (b.named - a.named) || a.order - b.order || a.key - b.key);
+    .sort((a, b) => {
+      if (!!a.estAt !== !!b.estAt) return a.estAt ? -1 : 1;                 // established things first…
+      if (a.estAt) return a.estAt - b.estAt || a.order - b.order || a.key - b.key; // …in the order they settled (ties: left to right), never reshuffled
+      return b.sure - a.sure || a.order - b.order || a.key - b.key;          // the rest: surest first, then left to right
+    });
   return shown;
 }
 

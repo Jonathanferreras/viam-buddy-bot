@@ -149,7 +149,7 @@ export default function DeskView({ st, busy, bump, onNotice }) {
     const tip = `${t.label}. ${longSize(o)}, ${fmtCm(o.dist_mm)} from the camera.` + (phrase ? ` Say “${prefix}${phrase}”.` : "") + (t.seen ? "" : " (Not seen for a moment.)");
     const target = isTarget(t);
     return (
-      <button key={t.key} type="button" className={`tile${generic ? " tile--generic" : ""}${t.seen ? "" : " gone"}${target ? " target" : ""}`}
+      <button key={t.key} type="button" className={`tile${generic ? " tile--generic" : ""}${t.seen ? "" : " gone"}${target ? " target" : ""}${t.estAt ? "" : " tile--settling"}`}
         aria-pressed={t.key === selKey} title={tip} aria-label={tip}
         onClick={() => pick(t.key)} onPointerEnter={() => setHovKey(t.key)} onPointerLeave={() => setHovKey(null)}>
         <span className="tile__top"><span className="tile__sw" style={{ background: t.swatch || "var(--fill2)" }} />{t.base}{t.n && <span className="tile__n">#{t.n}</span>}</span>

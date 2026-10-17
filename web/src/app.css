@@ -226,6 +226,7 @@ button.orb__btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 4
 .tile.target { box-shadow: 0 0 0 2px var(--green) inset; }
 .tile.target .tile__st { color: var(--green); font-weight: 600; }
 .tile.gone { opacity: .45; }
+.tile--settling { opacity: .72; } /* still being confirmed: the only tiles that may move */
 .tile--generic { border-color: rgba(161,161,166,.45); border-style: dashed; }
 .tile__top { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; white-space: nowrap; }
 .tile__sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
