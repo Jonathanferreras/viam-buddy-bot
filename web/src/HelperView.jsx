@@ -4,6 +4,7 @@ import { useFrame, useLocal, useReach } from "./hooks.js";
 import { Check } from "./icons.jsx";
 import { roleFor, sayPrefix } from "./roles.js";
 import Feed, { LiveBadge, waitText } from "./Feed.jsx";
+import { AddForm, teach, useLabelStyles, useOptimistic } from "./LabelEditor.jsx";
 
 const STAGES = [
   { id: "look", label: "Find it" },
@@ -25,7 +26,10 @@ export default function HelperView({ st, cams, busy, bump, onNotice }) {
   const deskSrc = useFrame(deskCam ? deskCam.name : null, kind, !!deskCam, 150, bump, true);
 
   // ---- things within reach, as one list ----
-  const items = useReach(wristCam, deskCam);
+  useLabelStyles();
+  const optimistic = useOptimistic();                       // what you just changed shows at once
+  const items = optimistic.apply(useReach(wristCam, deskCam));
+  const [adding, setAdding] = useState(null);               // the Unidentified tile being named
   const [selKey, setSelKey] = useState(null);
   const [hovKey, setHovKey] = useState(null);
   useEffect(() => { if (selKey !== null && !items.some((t) => t.key === selKey)) setSelKey(null); }, [items, selKey]);
@@ -49,11 +53,22 @@ export default function HelperView({ st, cams, busy, bump, onNotice }) {
       const l = Math.max(0, x0 - pad), tp = Math.max(0, y0 - pad);
       return {
         key: t.key, label: t.label, sel: t.key === selKey, hov: t.key === hovKey, target: isTarget(t), low: y0 < H * 0.12,
+        x: t.named && !isTarget(t) ? () => unverify(t) : null,
         dist: fmtDist(t[side].obj.dist_mm),
         l: (l / W) * 100, t: (tp / H) * 100, w: ((Math.min(W, x1 + pad) - l) / W) * 100, h: ((Math.min(H, y1 + pad) - tp) / H) * 100,
       };
     });
   };
+
+  // ---- × on a Verified thing: it isn't one (moves to Unidentified, keeping its name) ----
+  function unverify(t) {
+    optimistic.set(t.key, { named: false });
+    teach(t, cams, null, false).catch((e) => {
+      optimistic.clear(t.key);
+      setGrabMsg({ cls: "no", text: `Couldn’t move the ${t.label.toLowerCase()}: ${e.message}` });
+      setTimeout(() => setGrabMsg(null), 5000);
+    });
+  }
 
   // ---- click a thing, then "Grab with Helper" ----
   const sel = selKey === null ? null : items.find((t) => t.key === selKey) || null;
@@ -99,13 +114,28 @@ export default function HelperView({ st, cams, busy, bump, onNotice }) {
     const phrase = t.grab && t.named ? `grab the ${t.label.toLowerCase()}` : "";
     const tip = `${t.label}. ${longSize(o)}, ${fmtCm(o.dist_mm)} from the camera.` + (phrase ? ` Say “${prefix}${phrase}”.` : "") + (t.seen ? "" : " (Not seen for a moment.)");
     const target = isTarget(t);
+    if (generic && adding === t.key) {
+      return (
+        <div key={t.key} className="tilewrap" role="listitem">
+          <AddForm item={t} cams={cams} optimistic={optimistic} onDone={() => setAdding(null)} onCancel={() => setAdding(null)} />
+        </div>
+      );
+    }
     return (
-      <button key={t.key} type="button" className={`tile${generic ? " tile--generic" : ""}${t.seen ? "" : " gone"}${target ? " target" : ""}${t.estAt ? "" : " tile--settling"}`}
-        aria-pressed={t.key === selKey} title={tip} aria-label={tip}
-        onClick={() => pick(t.key)} onPointerEnter={() => setHovKey(t.key)} onPointerLeave={() => setHovKey(null)}>
-        <span className="tile__top"><span className="tile__sw" style={{ background: t.swatch || "var(--fill2)" }} />{t.base}{t.n && <span className="tile__n">#{t.n}</span>}</span>
-        <span className="tile__st">{target ? "Grabbing now" : [shortSize(o), fmtDist(o.dist_mm)].filter(Boolean).join(" · ")}</span>
-      </button>
+      <div key={t.key} className={`tilewrap${generic ? " tilewrap--add" : ""}`} role="listitem"
+        onPointerEnter={() => setHovKey(t.key)} onPointerLeave={() => setHovKey(null)}>
+        <button type="button" className={`tile${generic ? " tile--generic" : ""}${t.seen ? "" : " gone"}${target ? " target" : ""}`}
+          aria-pressed={t.key === selKey} title={tip} aria-label={tip} onClick={() => pick(t.key)}>
+          <span className="tile__top"><span className="tile__sw" style={{ background: t.swatch || "var(--fill2)" }} />{t.base}{t.n && <span className="tile__n">#{t.n}</span>}</span>
+          <span className="tile__st">{target ? "Grabbing now" : [shortSize(o), fmtDist(o.dist_mm)].filter(Boolean).join(" · ")}</span>
+        </button>
+        {generic ? (
+          <button type="button" className="tile__add" onClick={() => setAdding(t.key)} title="Name it and move it to Verified">+ Add</button>
+        ) : !target && (
+          <button type="button" className="tile__x" onClick={() => unverify(t)} aria-label={`${t.label} isn't verified: move it to Unidentified`}
+            title="Not verified — move to Unidentified">×</button>
+        )}
+      </div>
     );
   };
 
@@ -168,13 +198,13 @@ export default function HelperView({ st, cams, busy, bump, onNotice }) {
           <>
             {named.length > 0 && (
               <>
-                <div className="group"><i className="group__dot group__dot--ok" /><span className="group__name">Verified</span><span className="group__sub">{named.length} · Buddy knows what these are</span></div>
+                <div className="group"><i className="group__dot group__dot--ok" /><span className="group__name">Verified</span><span className="group__sub">{named.length} · Buddy knows what these are — hover and press × if one isn’t right</span></div>
                 <div className="objgrid" role="list">{named.map((t) => tile(t, false))}</div>
               </>
             )}
             {unnamed.length > 0 && (
               <>
-                <div className="group"><i className="group__dot group__dot--warn" /><span className="group__name">Unidentified</span><span className="group__sub">{unnamed.length} · Still reachable — say “grab the {unnamed[0].label.toLowerCase()}” or tap one, then Grab</span></div>
+                <div className="group"><i className="group__dot group__dot--warn" /><span className="group__name">Unidentified</span><span className="group__sub">{unnamed.length} · Press + Add to name one — or tap it, then Grab</span></div>
                 <div className="objgrid" role="list">{unnamed.map((t) => tile(t, true))}</div>
               </>
             )}

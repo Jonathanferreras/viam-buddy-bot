@@ -198,7 +198,9 @@ export function useTracks(objects, fps, store) {
       const [label, swatch] = t.shown.split("\u0000");
       const m = label.match(/^(.*) (\d+)$/); // "White cup 2" -> base "White cup", n 2
       return { key: t.key, obj: t.obj, label, base: m ? m[1] : label, n: m ? +m[2] : null, swatch, order: t.order,
-               seen: now - t.lastSeen <= staleMs, named: !isGeneric(label),
+               seen: now - t.lastSeen <= staleMs,
+               // verified: what you set on the page (src/taught.py) wins; otherwise "has a real name"
+               named: t.obj.verified != null ? !!t.obj.verified : !isGeneric(label),
                estAt: t.estAt || 0,
                // confidence in tenths, so two unsettled tiles don't trade places over a rounding difference
                sure: Math.round((Math.min(t.hits, ESTABLISH_HITS) / ESTABLISH_HITS * 0.6 + agree * 0.4) * 10) };
@@ -233,29 +235,78 @@ export function useReach(wristCam, deskCam) {
   const live = (c) => (c && c.ok && !c.error ? c.objects : []);
   const wrist = useTracks(live(wristCam), wristCam ? wristCam.fps : 0, wristCam && wristCam.name);
   const desk = useTracks(live(deskCam), deskCam ? deskCam.fps : 0, deskCam && deskCam.name);
-  const taken = new Set(), items = [];
+  // Calm list: each thing keeps one identity (so its tile never remounts), its pairing between the two
+  // cameras sticks, the order is the order things first showed up (nothing is ever re-sorted), a thing is
+  // listed only once it's been there a moment, and stays (faded) a few seconds after it's gone.
+  const R = useRef({ ids: new Map(), seq: 0, items: new Map(), pass: 0 });
+  const mem = R.current, now = Date.now();
   const grabOf = (t, cam) => (t && cam && t.obj.grab && t.obj.grab.arm ? { cam: cam.name, obj: t.obj, info: t.obj.grab } : null);
-  const merge = (w, d) => {
-    const pick = w && w.named ? w : d && d.named ? d : w || d;   // the view that knows what it is names it
+  const merge = (key, w, d) => {
+    // a view where you set the name / verified status on the page names it (even "not verified", which
+    // must beat the other camera's own guess); otherwise the view that knows what it is names it
+    const taught = [w, d].find((t) => t && t.obj.taught);
+    const pick = taught || (w && w.named ? w : d && d.named ? d : w || d);
     const ests = [w, d].filter((t) => t && t.estAt).map((t) => t.estAt);
     return {
-      key: d ? `d${d.key}` : `w${w.key}`, label: pick.label, base: pick.base, n: pick.n, swatch: pick.swatch, named: pick.named,
+      key, label: pick.label, base: pick.base, n: pick.n, swatch: pick.swatch, named: pick.named,
       seen: !!((w && w.seen) || (d && d.seen)), estAt: ests.length ? Math.min(...ests) : 0, sure: Math.max(w ? w.sure : 0, d ? d.sure : 0),
       order: pick.order, wrist: w, desk: d, obj: pick.obj,
       grab: grabOf(w, wristCam) || grabOf(d, deskCam) || null,
       why: (w && w.obj.grab && w.obj.grab.why) || (d && d.obj.grab && d.obj.grab.why) || "",
     };
   };
+  // pair the two views: pairs made before stay together; the rest pair by name as before
+  const pairs = [], usedD = new Set(), usedW = new Set();
   for (const w of wrist) {
-    let d = desk.find((t) => !taken.has(t.key) && t.label === w.label);
-    if (!d) d = desk.find((t) => !taken.has(t.key) && t.base === w.base && (!t.n || !w.n));
-    if (d) taken.add(d.key);
-    items.push(merge(w, d));
+    const k = mem.ids.get(`w${w.key}`);
+    const d = k && desk.find((t) => !usedD.has(t.key) && mem.ids.get(`d${t.key}`) === k);
+    if (d) { pairs.push([w, d]); usedW.add(w.key); usedD.add(d.key); }
   }
-  for (const d of desk) if (!taken.has(d.key)) items.push(merge(null, d));
-  return items.sort((a, b) => {
-    if (!!a.estAt !== !!b.estAt) return a.estAt ? -1 : 1;
-    if (a.estAt) return a.estAt - b.estAt || a.order - b.order;
-    return b.sure - a.sure || a.order - b.order;
-  });
+  for (const w of wrist) {
+    if (usedW.has(w.key)) continue;
+    // a desk view not already paired this time; one with no wrist partner yet is preferred
+    const free = desk.filter((t) => !usedD.has(t.key));
+    const lone = (t) => ![...usedW].some((wk) => mem.ids.get(`w${wk}`) === mem.ids.get(`d${t.key}`));
+    let d = free.find((t) => t.label === w.label && lone(t)) || free.find((t) => t.label === w.label);
+    if (!d) d = free.find((t) => t.base === w.base && (!t.n || !w.n));
+    if (d) usedD.add(d.key);
+    pairs.push([w, d || null]);
+  }
+  for (const d of desk) if (!usedD.has(d.key)) pairs.push([null, d]);
+  // one stable key per thing; a thing the camera lost for a moment and found again (a new track) takes back
+  // its old tile when it's the same kind of thing in about the same spot
+  const pass = ++mem.pass || (mem.pass = 1);
+  const near = (a, b, r) => a && b && Math.hypot(a.obj.uv[0] - b.obj.uv[0], a.obj.uv[1] - b.obj.uv[1]) < r;
+  const adopt = (w, d, used) => {
+    const t = w || d;
+    for (const [key, m] of mem.items) {
+      if (used.has(key) || m.pass === pass || m.slot === null) continue;
+      const it = m.item;
+      if (it.base !== t.base && it.named === t.named) continue;
+      if ((d && near(d, it.desk, 50)) || (w && near(w, it.wrist, 90))) return key;
+    }
+    return null;
+  };
+  const usedKeys = new Set();
+  for (const [w, d] of pairs) {
+    let k = (d && mem.ids.get(`d${d.key}`)) || (w && mem.ids.get(`w${w.key}`));
+    if (!k || usedKeys.has(k)) k = adopt(w, d, usedKeys) || `i${++mem.seq}`;
+    usedKeys.add(k);
+    if (d) mem.ids.set(`d${d.key}`, k);
+    if (w) mem.ids.set(`w${w.key}`, k);
+    const prev = mem.items.get(k);
+    mem.items.set(k, { item: merge(k, w, d), first: prev ? prev.first : now, slot: prev ? prev.slot : null, last: now, pass });
+  }
+  const SHOW_AFTER = 900, LINGER = 3500;
+  const out = [];
+  for (const [k, m] of mem.items) {
+    if (now - m.last > LINGER) { mem.items.delete(k); continue; }
+    if (m.slot === null) {
+      if (now - m.first < SHOW_AFTER) continue;          // brand new: wait a moment before listing it
+      m.slot = ++mem.seq;                                // its place in the list, for good
+    }
+    out.push(now - m.last > 600 ? { ...m.item, seen: false, slot: m.slot } : { ...m.item, slot: m.slot });
+  }
+  if (mem.ids.size > 400) for (const id of [...mem.ids.keys()].slice(0, 200)) mem.ids.delete(id);
+  return out.sort((a, b) => a.slot - b.slot);
 }

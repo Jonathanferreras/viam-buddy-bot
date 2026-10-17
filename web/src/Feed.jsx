@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { depthAt, fmtMM } from "./api.js";
 
 // Where the picture actually sits inside the figure. The frame is letterboxed (object-fit: contain)
@@ -65,11 +65,18 @@ export default function Feed({ cam, src, kind = "color", caption, boxes = [], on
           </div>
         )}
         {src && boxes.map((b) => (
-          <button key={b.key} type="button" className={`box${b.sel ? " sel" : ""}${b.hov ? " hov" : ""}${b.target ? " target" : ""}${b.low ? " low" : ""}`}
-            style={{ left: `${b.l}%`, top: `${b.t}%`, width: `${b.w}%`, height: `${b.h}%` }} onClick={() => onPick && onPick(b.key)}
-            aria-label={b.label} aria-pressed={b.sel}>
-            <b>{b.label}{b.target && b.dist ? ` · ${b.dist}` : ""}</b>
-          </button>
+          <Fragment key={b.key}>
+            <button type="button" className={`box${b.sel ? " sel" : ""}${b.hov ? " hov" : ""}${b.target ? " target" : ""}${b.low ? " low" : ""}`}
+              style={{ left: `${b.l}%`, top: `${b.t}%`, width: `${b.w}%`, height: `${b.h}%` }} onClick={() => onPick && onPick(b.key)}
+              aria-label={b.label} aria-pressed={b.sel}>
+              <b>{b.label}{b.target && b.dist ? ` · ${b.dist}` : ""}</b>
+            </button>
+            {b.x && (   /* optional: a view can offer an × on a box (the Helper: "not verified") */
+              <button type="button" className="box__x" style={{ left: `${b.l + b.w}%`, top: `${b.t}%` }}
+                onClick={(e) => { e.stopPropagation(); b.x(); }} aria-label={`${b.label} isn't verified: move it to Unidentified`}
+                title="Not verified — move to Unidentified">×</button>
+            )}
+          </Fragment>
         ))}
         {cups && src && cups.map((c) => (
           <button key={c.slot} type="button" className={`cuptap${c.picked ? " cuptap--picked" : ""}${c.live ? " cuptap--live" : ""}`}

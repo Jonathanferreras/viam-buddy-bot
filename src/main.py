@@ -202,6 +202,8 @@ _INTENTS = [
 _COLORS = ["red", "green", "yellow", "blue", "white", "black", "gray", "grey", "orange", "purple", "pink", "brown"]
 # what people call things -> the names the camera's object naming uses
 _NOUNS = {
+    "fork": {"fork"}, "spoon": {"spoon"}, "knife": {"knife"},
+    "utensil": {"fork", "spoon", "knife"}, "cutlery": {"fork", "spoon", "knife"}, "silverware": {"fork", "spoon", "knife"},
     "ball": {"ball"}, "sphere": {"ball"}, "cup": {"cup", "mug"}, "mug": {"mug", "cup"}, "glass": {"cup"},
     "block": {"block", "box"}, "cube": {"block", "box"}, "brick": {"block"}, "box": {"box", "block"},
     "phone": {"phone"}, "bottle": {"bottle"}, "can": {"can"}, "cable": {"cable"}, "cord": {"cable"},
@@ -1219,7 +1221,10 @@ class VoiceRouter(Generic, EasyResource):
                 if only is None:     # words for free-form commands ("pick up the red ball"), usable in any order
                     vocab.append(" ".join(sorted(set(_NLU_WORDS) | features.words())))
                     vocab.append(self.wake_word)   # "hey buddy", so the wake word can be recognised at all
-                return KaldiRecognizer(model, SAMPLE_RATE, json.dumps(vocab + ["[unk]"]))
+                rec = KaldiRecognizer(model, SAMPLE_RATE, json.dumps(vocab + ["[unk]"]))
+                # a feature may pair it with an open-vocabulary recogniser (src/features/llm.py, smart mode)
+                hook = getattr(self, "_speech_hook", None) if only is None else None
+                return (hook(rec, lambda: KaldiRecognizer(model, SAMPLE_RATE)) or rec) if hook else rec
             return KaldiRecognizer(model, SAMPLE_RATE)
 
         return make_recognizer
@@ -1543,7 +1548,9 @@ class VoiceRouter(Generic, EasyResource):
     async def _route(self, text: str, typed: bool = False) -> Dict[str, Any]:
         self.state["last_transcript"] = text
         cmd, score = self._match(text)
-        if score < 100:              # not one of the exact phrases: work out what was meant
+        # not one of the exact phrases, or several steps in one ("grab the yellow block and put it in the
+        # center" contains the phrase "grab the yellow block"): work out what was meant
+        if score < 100 or re.search(r"\b(and|then)\b", text.lower()):
             meant = self._understand(text)
             if meant is not None:
                 cmd, score = meant, 100.0
@@ -2135,12 +2142,95 @@ class VoiceRouter(Generic, EasyResource):
         if cam is None:
             return None, {}, "no distance reading for it"
         top = link.to_arm(cam)
-        extras: Dict[str, Any] = {"axis": None, "height": float((obj.get("size_mm") or [0, 0, 0])[2] or 0)}
+        height = float((obj.get("size_mm") or [0, 0, 0])[2] or 0)
+        if not obj.get("on_top") and height > 0:
+            # the link was learned from things all lying at one height: it places things well across the table
+            # but poorly in height (it put flat blocks 10 cm up). The camera measured the thing's own height
+            # above the table, which is what the gripper needs.
+            top = [top[0], top[1], float(self.vision["table_z_mm"]) + height]
+        extras: Dict[str, Any] = {"axis": None, "height": height, "via": "link",
+                                  "color": (obj.get("block") or obj.get("color") or "").lower(),
+                                  "size": list(obj.get("size_mm") or [])}
         if obj.get("axis_cam"):
             d = link.R @ np.array(obj["axis_cam"], float)
             if math.hypot(d[0], d[1]) > 0.3:
                 extras["axis"] = [float(d[0]), float(d[1])]
         return top, extras, ""
+
+    async def _look_closer(self, g: Dict[str, Any], top: List[float], extras: Dict[str, Any], what: str):
+        """Something the table camera found: its link puts it within a couple of centimetres, which is tight for
+        a 3 cm block. Find it with arm `g`'s own camera instead — from where the arm is, else from right above
+        the spot — and return (top, height, extras) from that, or None to go by the table camera."""
+        import numpy as np
+        c = next((x for x in getattr(self, "live_cams", []) if x.get("arm") == g["key"] and x.get("cam") is not None
+                  and x.get("arm_res") is not None), None)
+        if c is None:
+            return None
+        name = _cap(g["name"])
+
+        def nearest(objs):
+            best = None
+            for o in objs:
+                try:
+                    p, _ = self._wrist_point(o, c)
+                except Exception:
+                    p = None
+                if p is None:
+                    continue
+                d = math.hypot(p[0] - top[0], p[1] - top[1])
+                if d > 60:
+                    continue
+                col = (o.get("block") or o.get("color") or "").lower()
+                score = d - (20 if extras.get("color") and col == extras["color"] else 0)
+                if best is None or score < best[0]:
+                    best = (score, d, o, p)
+            return best
+
+        self._set_phase("running", current=f"{name} is taking a closer look at the {what}")
+        self._stage = "look"
+        best = nearest(await self._fresh_objects(c, frames=2, timeout=4.0))
+        if best is None:
+            # not in view from here: go right above it (straight moves, our own kinematics) and look again
+            q0 = await self._ik_ready(g)
+            if q0 is None:
+                return None
+            v = self.vision
+            cur = kin.fk(q0)
+            xa = np.array([cur[0, 0], cur[1, 0], 0.0])
+            xa = xa / np.linalg.norm(xa) if np.linalg.norm(xa) > 0.3 else np.array([1.0, 0.0, 0.0])
+            T = kin.pose_down(top[0], top[1], v["table_z_mm"] + 420.0, xa)
+            m = c.get("mount") or {}
+            off = T[:3, :3] @ np.array([float(m.get("x", 0.0)), float(m.get("y", 0.0)), 0.0])
+            T[0, 3] -= off[0]
+            T[1, 3] -= off[1]                        # the camera, not the flange, over the thing
+
+            def plan():
+                pts, q = [], q0
+                if cur[2, 3] < T[2, 3] - 5:          # low: rise straight up first
+                    up = cur.copy()
+                    up[2, 3] = T[2, 3]
+                    rise = kin.line(q, up)
+                    if rise is None:
+                        return None
+                    pts += rise
+                    q = rise[-1]
+                travel = kin.line(q, T, step_mm=35.0, step_deg=10.0) or kin.line(q, T)
+                return None if travel is None else pts + travel
+
+            path = await asyncio.to_thread(plan)
+            if path is None:
+                LOGGER.info(f"{name}: can't get above the {what} to look; going by the table camera")
+                return None
+            await self._move_line(g["arm"], path, self._travel_speed())
+            await asyncio.sleep(0.5)                 # still, so the picture and the arm's position agree
+            best = nearest(await self._fresh_objects(c, frames=2, timeout=4.0))
+        if best is None:
+            LOGGER.info(f"{name}: couldn't see the {what} up close; going by the table camera")
+            return None
+        _, d, o, p = best
+        h = float((o.get("size_mm") or [0, 0, 0])[2] or 0)
+        LOGGER.info(f"{name}: up close the {what} is {d:.0f} mm from where the table camera put it")
+        return p, h, {**self._wrist_extras(o, c), "via": "wrist"}
 
     def _in_action_task(self) -> bool:
         """True when called from the running action itself (False from the page's thread)."""
@@ -2872,6 +2962,10 @@ class VoiceRouter(Generic, EasyResource):
         if g["holding"]:
             raise ValueError(f"{name} is already holding the {g['holding']} — say “let go” first")
         self._action_arms = [g["key"]]
+        if (extras or {}).get("via") == "link":      # found by the table camera: check with the arm's own camera
+            closer = await self._look_closer(g, top, extras, what)
+            if closer is not None:
+                top, height_mm, extras = closer
         tcp, floor = v["finger_mm"], v["table_z_mm"] + 8
         lowest_flange = v["table_z_mm"] + 6 + v["planner_finger_mm"]   # the planner's gripper model clears the table
         # fingertips partway down its side (most of a short thing, the top 3 cm of a tall one), never below the floor
@@ -2881,6 +2975,10 @@ class VoiceRouter(Generic, EasyResource):
         if height_mm > 3:
             floor = max(floor, top[2] - height_mm + 8)
             grip_z = max(grip_z, floor)
+        if 0 < height_mm < 12:
+            # flat (a fork, a spoon): only the bottom few mm can be pinched, so the fingertips go nearly down to
+            # the mat (the camera measured it just beside the thing; the mat is soft foam), never below the table
+            grip_z = max(top[2] - height_mm + 1.5, v["table_z_mm"] + 1.0)
         fast = await self._pick_straight(g, x, y, grip_z, what, height_mm, (extras or {}).get("axis"))
         if fast is not None:
             return fast

@@ -550,6 +550,8 @@ def detect_objects(color_img: Optional[Image.Image], depth_mm: np.ndarray, intr:
         r0, c0 = blob0[:, 0], blob0[:, 1]
         if _ring(blob0, surface, hh, ww) < 0.6:
             continue                                                  # not sitting on the mat or table
+        if _ring(blob0, mat, hh, ww) < MAT_RING_MIN:
+            continue                    # beside the mat, not on it: the phone, a plug, the power strip, the desk edge
         hb0 = H[r0, c0][valid[r0, c0]]
         if hb0.size >= 5 and (float(np.percentile(hb0, 10)) > 60 or float(np.median(hb0)) > 90):
             # Everything well above the table: usually part of an arm reaching in. But a can or bottle
@@ -564,13 +566,17 @@ def detect_objects(color_img: Optional[Image.Image], depth_mm: np.ndarray, intr:
                         and hb0.size >= 12)
             if not standing:
                 continue                                              # floating above the table: part of an arm
-        parts.extend(_split_stacked(blob0, H, valid, min_px))
+        for piece in _split_colors(blob0, hue, sat, val, min_px, H, valid):   # touching things of different colors
+            parts.extend(_split_stacked(piece, H, valid, min_px))
     e1 = np.cross(n, [1.0, 0.0, 0.0]); e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1)   # axes in the table plane
     for blob, rest in parts:                                          # rest: height of what it lies on (0 = table)
         rows, cols = blob[:, 0], blob[:, 1]
+        flat_grip = None
         hb = H[rows, cols][valid[rows, cols]]
         # its own height (for a thing lying on another, measured from that thing's top)
         height = max(0.0, float(np.percentile(hb, 90)) - rest) if hb.size >= 5 else 0.0
+        if hb.size < 5 or height < 3.0:
+            continue                    # no depth reading, or flat: a mark, a shadow, a reflection — not a thing
         zs = d[rows, cols][valid[rows, cols]]
         z = float(np.median(zs)) if zs.size else None
         tall = height > 40
@@ -614,14 +620,40 @@ def detect_objects(color_img: Optional[Image.Image], depth_mm: np.ndarray, intr:
             if length > 1.3 * max(width, 1):
                 major = V[:, int(np.argmax(ext))]
                 axis = major[0] * e1 + major[1] * e2
-            if length > 7 * max(width, 1):
-                continue                                              # a cable
+            if length > 7 * max(width, 1) and width < 9:
+                continue                                              # a cable (cord-thin; a fork or a pen is wider)
+            if axis is not None and length > 4 * max(width, 1) and height < 15:
+                # Long and flat (a fork, a spoon, a pen): the middle of it is often the flattest, thinnest part
+                # (a fork's handle lies flat on the mat). Grip it where it stands highest and is still narrow
+                # enough for the fingers: a fork's neck, where it bends up into the tines.
+                imaj = int(np.argmax(ext))
+                along, across = c2[:, imaj], c2[:, 1 - imaj]
+                hh_all = H[rows, cols]
+                okv = valid[rows, cols]
+                edges = np.linspace(along.min(), along.max(), 11)
+                best = None
+                for lo_, hi_ in zip(edges[:-1], edges[1:]):
+                    m = (along >= lo_) & (along <= hi_) & okv
+                    if m.sum() < 6:
+                        continue
+                    wbin = float(np.percentile(across[m], 95) - np.percentile(across[m], 5)) / 0.9
+                    hbin = float(np.percentile(hh_all[m], 90))
+                    if wbin <= 60 and (best is None or hbin > best[0]):
+                        best = (hbin, wbin, m)
+                if best is not None and best[0] >= 3:
+                    hbin, wbin, m = best
+                    pts_b = P[rows[m], cols[m]]
+                    top_pt = pts_b.mean(axis=0) + n * (hbin - float(np.mean(pts_b @ n + off)))
+                    height = max(height, hbin)
+                    flat_grip = round(min(wbin, width))
         if length > 300 or length < 12:
             continue                                                  # laptop-sized, or a speck
         # what the gripper's fingers close on: the top few cm of it (a tall thing is gripped near its top),
         # measured from the depth points themselves. An upside-down cup is grabbed by its narrow base,
         # not its wide rim on the table.
         grip = width
+        if not tall and flat_grip:
+            grip = flat_grip                                          # a long flat thing: across where it's gripped
         cut_off = rows.min() == 0 or cols.min() == 0 or rows.max() >= hh - 1 or cols.max() >= ww - 1
         if tall and hb.size >= 20 and not cut_off:   # (half out of the picture: don't trust a narrow reading)
             top_h = float(np.percentile(hb, 95))
@@ -675,6 +707,121 @@ def detect_objects(color_img: Optional[Image.Image], depth_mm: np.ndarray, intr:
             "on_top": rest > 0,
         })
     return {"table": True, "objects": objects}
+
+
+def _color_class(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Per pixel: 0 = no strong color (white, gray, black, wood), else 1 red, 2 orange, 3 yellow, 4 green,
+    5 blue, 6 purple / pink."""
+    k = np.zeros(h.shape, np.int8)
+    strong = (s > 0.42) & (v > 0.2)
+    hh = np.where(h > 330, h - 360, h)
+    for cls, (lo, hi) in enumerate(((-30, 14), (14, 40), (40, 68), (68, 165), (165, 250), (250, 330)), start=1):
+        k[strong & (hh >= lo) & (hh < hi)] = cls
+    return k
+
+
+# colors that one thing can show at once (its lit and shaded faces, warm wood): split those only on a height step
+_SHADES = {frozenset((1, 2)), frozenset((2, 3)), frozenset((1, 6))}
+
+
+def _split_colors(blob: np.ndarray, hue: np.ndarray, sat: np.ndarray, val: np.ndarray, min_px: int,
+                  H: Optional[np.ndarray] = None, valid: Optional[np.ndarray] = None) -> List[np.ndarray]:
+    """Two things touching (a fork lying against a red block, a green block standing beside a yellow one) come
+    out of the depth as one blob, and grabbing "it" aims at the empty middle. If a blob is made of clearly
+    different colors in big connected pieces, each piece becomes its own blob; small bits of another color
+    (shadows, edges) stay with the piece they touch. Pieces whose colors one thing can show at once — shades
+    of each other (a yellow cube's shaded side looks orange) or plain (white, gray, black, wood) beside a
+    color (a screwdriver's black ends) — stay together unless one stands clearly taller than the other."""
+    rows, cols = blob[:, 0], blob[:, 1]
+    n = len(blob)
+    if n < 4 * min_px:
+        return [blob]
+    k = _color_class(hue[rows, cols], sat[rows, cols], val[rows, cols])
+    big = max(2 * min_px, int(0.15 * n))
+    counts = np.bincount(k, minlength=7)
+    if int((counts >= big).sum()) < 2:
+        return [blob]
+    r0, c0 = rows.min(), cols.min()
+    hgt, wid = rows.max() - r0 + 1, cols.max() - c0 + 1
+    inside = np.zeros((hgt, wid), bool)
+    inside[rows - r0, cols - c0] = True
+    cls = np.full((hgt, wid), -1, np.int16)
+    cls[rows - r0, cols - c0] = k
+    label = np.zeros((hgt, wid), np.int32)          # 0 = not yet given to a piece
+    seeds = 0
+    for c_ in range(7):
+        if counts[c_] < big:
+            continue
+        for comp in _components(cls == c_, 1):
+            if len(comp) >= big:
+                seeds += 1
+                label[comp[:, 0], comp[:, 1]] = seeds
+    if seeds < 2:
+        return [blob]
+    for _ in range(max(hgt, wid)):                  # the rest of the blob joins the piece it touches
+        todo = inside & (label == 0)
+        if not todo.any():
+            break
+        grown = label.copy()
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            src = np.zeros_like(label)
+            if dr > 0:
+                src[dr:, :] = label[:-dr, :]
+            elif dr < 0:
+                src[:dr, :] = label[-dr:, :]
+            elif dc > 0:
+                src[:, dc:] = label[:, :-dc]
+            else:
+                src[:, :dc] = label[:, -dc:]
+            take = todo & (grown == 0) & (src > 0)
+            grown[take] = src[take]
+        if (grown == label).all():
+            break
+        label = grown
+    # each piece's color, and how high it stands (90th percentile of its heights above the table)
+    seed_cls, top, peak = {}, {}, {}
+    for i in range(1, seeds + 1):
+        m = label == i
+        vals = cls[m]
+        seed_cls[i] = int(np.bincount(vals[vals >= 0], minlength=7).argmax()) if vals.size else 0
+        if H is not None and valid is not None:
+            rr, cc = np.nonzero(m)
+            hv = H[rr + r0, cc + c0][valid[rr + r0, cc + c0]]
+            top[i] = float(np.percentile(hv, 90)) if hv.size >= 5 else 0.0
+            peak[i] = float(np.percentile(hv, 98)) if hv.size >= 5 else 0.0
+    # touching pieces that could be one thing are put back together
+    parent = list(range(seeds + 1))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    pairs = set()
+    for dr, dc in ((1, 0), (0, 1)):
+        a, b = label[:hgt - dr, :wid - dc], label[dr:, dc:]
+        both = (a > 0) & (b > 0) & (a != b)
+        pairs |= {(int(x), int(y)) for x, y in zip(a[both], b[both])}
+    for a, b in pairs:
+        ca, cb = seed_cls[a], seed_cls[b]
+        could_be_one = ca == cb or ca == 0 or cb == 0 or frozenset((ca, cb)) in _SHADES
+        # the step between them: the taller one's top above the lower one's highest point. A cube's shaded side
+        # reaches right up to its top (no step); a fork lying against a block stays low all the way (a step)
+        hi_, lo_ = (a, b) if top.get(a, 0.0) >= top.get(b, 0.0) else (b, a)
+        step = max(0.0, top.get(hi_, 0.0) - peak.get(lo_, 0.0)) if top else 0.0
+        if could_be_one and step < 15.0:
+            parent[find(a)] = find(b)
+    out = []
+    for root in sorted({find(i) for i in range(1, seeds + 1)}):
+        m = np.isin(label, [i for i in range(1, seeds + 1) if find(i) == root])
+        rr, cc = np.nonzero(m)
+        if len(rr) >= min_px:
+            out.append(np.stack([rr + r0, cc + c0], axis=1))
+    return out or [blob]
+
+
+# How much of what's around a thing must be the blue mat for it to count as on the desk (0 = anywhere).
+MAT_RING_MIN = 0.25
 
 
 def _split_stacked(blob: np.ndarray, H: np.ndarray, valid: np.ndarray, min_px: int) -> List[Tuple[np.ndarray, float]]:

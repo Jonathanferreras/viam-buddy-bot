@@ -26,6 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from . import taught   # names / verified settings taught on the status page
+
 REPO = "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/"
 FILES = {"vision.onnx": "onnx/vision_model_quantized.onnx",
          "text.onnx": "onnx/text_model_quantized.onnx",
@@ -62,6 +64,9 @@ DEFAULT_VOCAB: Dict[str, List[str]] = {
     "screwdriver": ["a screwdriver", "a small stubby screwdriver with a yellow and black handle",
                     "a screwdriver lying on a table seen from above", "a short screwdriver with a rubber grip"],
     "tool": ["a pair of pliers", "a hand tool", "a wrench"],
+    "fork": ["a fork", "a plastic fork", "a disposable plastic fork", "a fork lying flat on a table seen from above"],
+    "spoon": ["a spoon", "a plastic spoon", "a spoon lying flat on a table"],
+    "knife": ["a plastic knife", "a butter knife", "a table knife lying flat"],
     "ball": ["a ball", "a small rubber ball", "a round toy ball", "a ball seen from above"],
     "fruit": ["an apple", "a banana", "an orange"],
     "robot part": ["a robot gripper", "part of a robot arm"],
@@ -86,6 +91,9 @@ SHAPES: Dict[str, Dict[str, Any]] = {
     "pen":      {"tall": False, "l": (90, 200), "w": (5, 30)},
     "ball":     {"w": (20, 250), "h": (15, 250)},          # round: never a flat scrap
     "screwdriver": {"tall": False, "l": (50, 320), "w": (8, 50), "lw": 2.5},   # long and thin (not a block), lying flat
+    "fork":     {"tall": False, "l": (120, 260), "w": (10, 50), "lw": 4},      # cutlery: long, flat, lying down
+    "spoon":    {"tall": False, "l": (120, 260), "w": (10, 50), "lw": 4},
+    "knife":    {"tall": False, "l": (120, 260), "w": (8, 40), "lw": 5},
     "mouse":    {"l": (70, 140), "w": (40, 90)},
     "keyboard": {"tall": False, "l": (250, 500)},
     "laptop":   {"l": (250, 450)},
@@ -134,6 +142,12 @@ class Identifier:
     def status(self) -> Dict[str, Any]:
         return {"state": self.state, "detail": self.detail}
 
+    def embedding(self, oid: int) -> Optional[np.ndarray]:
+        """What tracked object `oid` looks like to CLIP (unit vector), once it has been looked at."""
+        with self._lock:
+            r = self._results.get(oid)
+            return None if r is None or r.get("emb") is None else r["emb"].copy()
+
     def label(self, objects: List[Dict[str, Any]], frame_jpeg: Optional[bytes]) -> List[Dict[str, Any]]:
         """Return objects with model names applied where we know them; queue the rest."""
         now = time.time()
@@ -165,7 +179,9 @@ class Identifier:
                     color = (o.get("color") or "").strip()
                     o["label"] = f"{color.capitalize()} {name}" if color else name.capitalize()
                     o["kind"], o["kind_conf"] = name, round(conf, 2)
+            o = taught.apply(o, r.get("emb") if r is not None else None)   # what you taught it wins
             out.append(o)
+        taught.prune(live_ids)
         with self._lock:                                   # forget objects that left the table
             for oid in [k for k in self._results if k not in live_ids]:
                 if now - self._results[oid]["t"] > 30:
@@ -190,14 +206,17 @@ class Identifier:
         while True:
             oid, jpeg, bbox = self._jobs.get()
             try:
-                probs = self._classify(jpeg, bbox)
+                probs, emb = self._classify(jpeg, bbox)
                 with self._lock:
                     r = self._results.get(oid)
                     if r is None:
-                        self._results[oid] = {"probs": probs, "looks": 1, "t": time.time()}
+                        self._results[oid] = {"probs": probs, "emb": emb, "looks": 1, "t": time.time()}
                     else:   # running average over a few looks so one bad crop doesn't flip the name
                         n = min(r["looks"], self.max_looks - 1)
-                        r.update(probs=(r["probs"] * n + probs) / (n + 1), looks=r["looks"] + 1, t=time.time())
+                        e = r.get("emb")
+                        e = emb if e is None else (e * n + emb) / (n + 1)
+                        r.update(probs=(r["probs"] * n + probs) / (n + 1), emb=e / np.linalg.norm(e),
+                                 looks=r["looks"] + 1, t=time.time())
             except Exception as e:
                 self.log.debug(f"classify failed for object {oid}: {e}")
             finally:
@@ -289,7 +308,7 @@ class Identifier:
         best = np.full(len(self._names), -np.inf, np.float32)
         np.maximum.at(best, self._owner, logits)
         p = np.exp(best - best.max())
-        return p / p.sum()
+        return p / p.sum(), e
 
     def _prior(self, probs: np.ndarray, geo: Optional[Dict[str, Any]]) -> np.ndarray:
         """Discount kinds the measured size/shape rules out, then renormalise."""

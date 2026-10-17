@@ -27,3 +27,11 @@ jenga/tower.json
 # shell game: captures and per-run plan caches (large, runtime)
 shell_game/robot/runs/
 shell_game/robot/stereo-scan/
+
+# local scratch copies and tool folders
+.llm_v*.py
+.moves_v*.py
+.vision_noise_v*.py
+.readme_new.md
+.claude-tmp/
+_to_delete/

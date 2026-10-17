@@ -61,6 +61,7 @@ h3 { font-size: 17px; font-weight: 700; letter-spacing: -.02em; }
 .pill--game { background: var(--indigo); color: #fff; font-weight: 700; }
 .pill--game i { background: #fff; animation: blink 1.4s ease-in-out infinite; }
 .pill--ext { background: var(--orange); color: #000; font-weight: 700; } .pill--ext i { background: #000; }
+.pill--manual { background: var(--blue); color: #fff; font-weight: 700; } .pill--manual i { background: #fff; animation: blink 1.4s ease-in-out infinite; }
 .pill--off { background: rgba(255,69,58,.2); } .pill--off i { background: var(--red); }
 .pill--live.on i { background: var(--green); animation: blink 2s ease-in-out infinite; }
 .pill--live.bad i { background: var(--red); }
@@ -85,6 +86,12 @@ h3 { font-size: 17px; font-weight: 700; letter-spacing: -.02em; }
 .voice__wake { color: var(--accent); }
 .voice__sub { font-size: 14px; color: var(--ink2); line-height: 1.35; text-wrap: pretty; min-height: 1.35em; }
 .voice__sep { width: 100%; height: 1px; background: var(--sep); }
+/* Simple / Smart: how Buddy understands speech (src/features/llm.py) */
+.nlu { position: absolute; top: 12px; right: 12px; z-index: 1; display: flex; gap: 2px; padding: 2px; border-radius: 999px; background: var(--fill3); }
+.nlu button { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 10px; border: 0; border-radius: 999px; background: transparent; color: var(--ink2); font-size: 11px; font-weight: 600; }
+.nlu button.on { background: var(--fill2); color: var(--ink); }
+.nlu button:not(.on):hover { color: var(--ink); }
+.nlu i { width: 6px; height: 6px; border-radius: 50%; background: var(--orange); }
 .countdown { width: 140px; height: 4px; margin: 6px auto 0; border-radius: 999px; background: var(--fill); overflow: hidden; }
 .countdown i { display: block; height: 100%; border-radius: 999px; background: var(--blue); transform-origin: left center; transition: transform .1s linear; }
 .voice__stop { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px; background: rgba(255,69,58,.14); font-size: 13px; }
@@ -151,6 +158,7 @@ button.orb__btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 4
 .stile--busy, .stile--hold { box-shadow: 0 0 0 2px var(--green) inset; }
 .stile--game { box-shadow: 0 0 0 2px var(--indigo) inset; }
 .stile--ext { box-shadow: 0 0 0 2px var(--orange) inset; }
+.stile--manual { box-shadow: 0 0 0 2px var(--blue) inset; }
 .stile--off { opacity: .6; }
 .stile--dim { opacity: .7; }
 .stile__top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -166,11 +174,13 @@ button.orb__btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 4
 .stile__line.quiet { color: var(--ink2); font-weight: 400; }
 .stile--game .stile__line { color: var(--indigo2); }
 .stile--ext .stile__line { color: var(--orange); }
+.stile--manual .stile__line { color: var(--blue2); }
 .stile--off .stile__line { color: var(--red); }
 .stile .pill { height: 24px; padding: 0 9px; font-size: 11px; font-weight: 700; gap: 6px; flex: none; max-width: 100%; overflow: hidden; }
 .stile .pill i { width: 6px; height: 6px; }
-.stile__btns { display: flex; gap: 6px; margin-top: auto; }
+.stile__btns { display: flex; flex-wrap: nowrap; gap: 6px; margin-top: auto; }
 .stile__btns .btn { height: 28px; padding: 0 9px; font-size: 11px; gap: 5px; }
+.stile__btns .btn--icon { width: 32px; height: 32px; padding: 0; justify-content: center; flex: none; }
 .stile--stop { justify-content: space-between; background: rgba(255,69,58,.16); cursor: pointer; transition: filter .15s, transform .1s; }
 .stile--stop:hover { filter: brightness(1.15); }
 .stile--stop.sent { transform: scale(.97); }

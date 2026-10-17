@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Check, Alert, Play, Stop } from "./icons.jsx";
 import { isGameCommand, wakeWord } from "./roles.js";
+import { post } from "./api.js";
 
 // What the orb and the headline say in each phase the router reports. `W` is the wake word ("Hey buddy").
 const PHASES = (W) => ({
@@ -127,6 +128,35 @@ function Steps({ st, flow, micOn, W }) {
 }
 
 // `say`: a few full phrases worth trying right now (shown while Buddy waits for the wake word).
+// How Buddy understands what you say: Simple (the usual phrases and rules) or Smart (a local LLM through
+// Ollama works out what you meant — src/features/llm.py). An orange dot: smart mode can't reach the model
+// right now, so the rules are standing in.
+function NluToggle({ st }) {
+  const n = st.features && st.features.llm;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  if (!n) return null;
+  const smart = n.mode === "llm";
+  const down = smart && n.ok === false;
+  async function set(mode) {
+    if (busy || mode === n.mode) return;
+    setBusy(true); setErr("");
+    try { await post({ action: "nlu_mode", mode }); }
+    catch (e) { setErr(e.message); }
+    finally { setBusy(false); }
+  }
+  const tip = err ? `Couldn’t switch: ${err}`
+    : !smart ? "Simple mode: the usual command phrases. Switch to Smart to have an LLM work out what you mean (or say “smart mode”)."
+    : down ? `Smart mode can’t use the model right now — ${n.why}. The usual rules are standing in.`
+    : `Smart mode: ${n.model} (Ollama) works out what you mean. Say “simple mode” to switch back.`;
+  return (
+    <div className={`nlu${down ? " nlu--down" : ""}`} role="group" aria-label="How Buddy understands you" title={tip}>
+      <button type="button" className={smart ? "" : "on"} aria-pressed={!smart} disabled={busy} onClick={() => set("rules")}>Simple</button>
+      <button type="button" className={smart ? "on" : ""} aria-pressed={smart} disabled={busy} onClick={() => set("llm")}>{down && <i />}Smart</button>
+    </div>
+  );
+}
+
 export default function VoicePanel({ st, flow, levels, micOn, onToggleMic, say = [] }) {
   const W = wakeWord(st);
   const P = PHASES(W);
@@ -143,6 +173,7 @@ export default function VoicePanel({ st, flow, levels, micOn, onToggleMic, say =
 
   return (
     <section className={`voice${flow.flash ? " voice--flash" : ""}`} aria-label="Voice">
+      <NluToggle st={st} />
       <Orb tone={tone} icon={p.icon} levels={levels} toggle={mutable} on={micOn} onToggle={onToggleMic} />
       <div className="voice__text">
         {transcript ? (

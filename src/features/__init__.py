@@ -9,7 +9,8 @@ What a feature can provide (all optional except `name`):
 
     name          short id, e.g. "cleanup"; its state shows on /state under features.<name>
     actions       the cmd["action"] values it runs, e.g. ("clean_up",)
-    words         extra words the speech recogniser should know ("clean", "tidy", ...)
+    words         extra words the speech recogniser should know ("clean", "tidy", ...), or a
+                  function returning them when they change (taught names)
     configure(router, attrs)         called whenever the router is (re)built from its config
     understand(router, words, text)  free-form speech -> a command (router._mk_cmd(action=...)) or None.
                                      Called for everything except "stop", before the built-in intents.
@@ -21,6 +22,8 @@ What a feature can provide (all optional except `name`):
     page_actions  {"name": async fn(router, body) -> dict}   POST /action {"action": "name", ...}
     do_commands   {"key": async fn(router, command) -> dict} DoCommand {"key": ...}
     state(router)                    a small dict for the status page
+    priority      int; higher is asked first in understand (default 0, then by file name)
+    catalogue(router)                lines describing its commands, for smart mode's list (src/features/llm.py)
 
 A feature that fails to import or raises in a hook is logged and skipped; it can't take the router down.
 """
@@ -47,6 +50,8 @@ class Feature:
     page_actions: Dict[str, Callable] = field(default_factory=dict)
     do_commands: Dict[str, Callable] = field(default_factory=dict)
     state: Optional[Callable] = None
+    priority: int = 0
+    catalogue: Optional[Callable] = None
 
 
 def _discover() -> List[Feature]:
@@ -74,7 +79,14 @@ def owns(action: Optional[str]) -> bool:
 
 
 def words() -> Set[str]:
-    return {w for f in FEATURES for p in f.words for w in p.split()}
+    out: Set[str] = set()
+    for f in FEATURES:
+        try:
+            ws = f.words() if callable(f.words) else f.words   # a function: words that change (taught names)
+        except Exception:
+            ws = ()
+        out |= {w.lower() for p in ws for w in p.split()}
+    return out
 
 
 def configure(router, attrs: Dict[str, Any]) -> None:
@@ -87,7 +99,7 @@ def configure(router, attrs: Dict[str, Any]) -> None:
 
 
 def understand(router, words_: List[str], text: str) -> Optional[Dict[str, Any]]:
-    for f in FEATURES:
+    for f in sorted(FEATURES, key=lambda f: -f.priority):   # stable: equal priorities stay in name order
         if f.understand:
             try:
                 cmd = f.understand(router, words_, text)
@@ -127,6 +139,18 @@ async def do_command(router, command: Dict[str, Any]) -> Optional[Dict[str, Any]
             if key in command:
                 return await fn(router, command)
     return None
+
+
+def catalogue(router) -> List[str]:
+    """Every feature's description of its commands, for the LLM (features without one are skipped)."""
+    out: List[str] = []
+    for f in FEATURES:
+        if f.catalogue:
+            try:
+                out.extend(f.catalogue(router))
+            except Exception as e:
+                LOGGER.error(f"feature '{f.name}': catalogue problem: {e}")
+    return out
 
 
 def state(router) -> Dict[str, Any]:
