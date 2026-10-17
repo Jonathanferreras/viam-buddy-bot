@@ -23,7 +23,7 @@ Config attributes:
   "command_window_s": 5,                     # seconds to say the command after the wake word
   "sounds": true,                            # play the wake / timeout / done chimes (sounds/*.mp3)
   "use_grammar": true,                       # restrict Vosk to the command phrases (more accurate)
-  "live_camera": "depth-cam",                # optional: camera shown live on the status page
+  "live_camera": "a17-depth-cam",            # optional: camera shown live on the status page
   "live_fps": 6,                             #   frames per second while a page is watching
   "live_depth_range_mm": [300, 1500],        #   optional fixed depth color range (default: auto)
   "record": {                               # optional: film a camera while a voice command moves an arm
@@ -181,7 +181,7 @@ _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixt
 _NLU_WORDS = sorted({w for _, ws in _INTENTS for p in ws for w in p.split()} | set(_COLORS) | set(_NOUNS)
                     | set(_ORDINALS) | {"two", "three", "four", "five", "six", "number"}
                     | {"the", "a", "an", "arm", "please", "can", "you", "me", "up", "it", "that", "this", "to",
-                       "your", "and", "now", "go", "thing", "one", "seventeen", "eighteen", "hey", "viam"})
+                       "your", "and", "now", "go", "thing", "one", "seventeen", "eighteen", "hey", "buddy"})
 
 
 def _number_duplicates(objs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
