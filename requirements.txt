@@ -1,0 +1,6 @@
+viam-sdk
+vosk
+rapidfuzz
+typing-extensions
+numpy
+pillow

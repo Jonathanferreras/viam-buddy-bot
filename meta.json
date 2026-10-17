@@ -1,0 +1,15 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "hackathons:voice-router",
+  "visibility": "private",
+  "url": "",
+  "description": "Routes 'Hey Viam, <command>' voice commands (local Vosk transcription) to DoCommand calls on other resources.",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "hackathons:voice-router:router",
+      "short_description": "Voice command router: wake-word audio in, DoCommand out."
+    }
+  ],
+  "entrypoint": "run.sh"
+}

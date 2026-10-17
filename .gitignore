@@ -1,0 +1,16 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# runtime data (downloaded / recorded at run time)
+models/
+recordings/
+debug/
+*.npz
+
+# frontend
+web/node_modules/
+web/dist/
+
+.DS_Store
