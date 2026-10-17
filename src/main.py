@@ -28,7 +28,8 @@ Config attributes:
   "live_depth_range_mm": [300, 1500],        #   optional fixed depth color range (default: auto)
   "live_cameras": [                          # or several cameras; "arm" marks one mounted on that arm
     {"camera": "a17-depth-cam", "label": "Table camera",
-     "work_area": [0, 0.33, 0.88, 1]},       #   only things inside this part of the picture count
+     "work_area": [0, 0.33, 0.88, 1],        #   only things inside this part of the picture count
+     "min_size_mm": 20},                     #   and at least this big (default 20; 0 = no limit)
     {"camera": "a17-cam", "arm": "a17-arm", "label": "Arm 17 camera"}   # (fractions: x0, y0, x1, y1)
   ],
   "record": {                               # optional: film a camera while a voice command moves an arm
@@ -264,6 +265,7 @@ def _live_cam_specs(attrs: Dict[str, Any], vis: Dict[str, Any]) -> List[Dict[str
             seen.add(c["camera"])
             c["label"] = c.get("label") or ("Camera" if not out else c["camera"])
             c["work_area"] = _work_area(c.get("work_area"), c["camera"])
+            c["min_size_mm"] = float(c.get("min_size_mm", 20))
             out.append(c)
     return out
 
@@ -293,6 +295,22 @@ def _in_work_area(objs: List[Dict[str, Any]], area: Optional[List[float]], size:
     w, h = size
     x0, y0, x1, y1 = area[0] * w, area[1] * h, area[2] * w, area[3] * h
     return [o for o in objs if x0 <= o["uv"][0] <= x1 and y0 <= o["uv"][1] <= y1]
+
+
+def _big_enough(objs: List[Dict[str, Any]], min_mm: float) -> List[Dict[str, Any]]:
+    """Drop specks the gripper couldn't pick anyway: anything under `min_mm` across, and flat strips
+    (tape, stickers, reflections) under half of that wide."""
+    if min_mm <= 0:
+        return objs
+    out = []
+    for o in objs:
+        length, width, height = (list(o.get("size_mm") or [0, 0, 0]) + [0, 0, 0])[:3]
+        if max(length, width) < min_mm:
+            continue
+        if height < 8 and min(length, width) < min_mm / 2:
+            continue
+        out.append(o)
+    return out
 
 
 def _find_arm(router: "VoiceRouter", name: str) -> Arm:
@@ -793,7 +811,8 @@ class VoiceRouter(Generic, EasyResource):
                     try:
                         found = await asyncio.to_thread(self._detect_live, out, intr, colors)
                         h, w = out["depth_mm"].shape[:2]
-                        inside = _in_work_area(found["objects"], c.get("work_area"), (w, h))
+                        inside = _big_enough(_in_work_area(found["objects"], c.get("work_area"), (w, h)),
+                                             c.get("min_size_mm", 20))
                         objs = namer.label(tracker.update(inside), out["color"])
                         status_page.set_live_status(name, table=found["table"], objects=objs, detect_error=None,
                                                     naming=namer.status())
