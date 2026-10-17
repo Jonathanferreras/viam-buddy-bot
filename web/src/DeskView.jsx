@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { post, depthAt, fmtMM, fmtDist, fmtCm, shortSize, longSize, cap } from "./api.js";
 import { useFrame, useLocal, useTracks } from "./hooks.js";
-import { Mic } from "./icons.jsx";
+import { Mic, Check } from "./icons.jsx";
+
+const STAGES = [
+  { id: "look", label: "Find it" },
+  { id: "reach", label: "Reach" },
+  { id: "grip", label: "Grip" },
+  { id: "lift", label: "Lift" },
+  { id: "deliver", label: "Hand it to you" },
+];
 import { camLabel, roleFor, sayPrefix } from "./roles.js";
 
 // ---- one picture (color or depth) with its detection boxes and the hover readout ----
@@ -46,8 +54,8 @@ export default function DeskView({ st, busy, bump, onNotice }) {
   const setView = (v) => setViews({ ...views, [name]: v });
 
   const streaming = !!(cam && cam.ok && !cam.paused && !cam.error);
-  const colorSrc = useFrame(name, "color", !!cam && (view === "both" || view === "color"), 120, bump);
-  const depthSrc = useFrame(name, "depth", !!cam && (view === "both" || view === "depth"), 120, bump);
+  const colorSrc = useFrame(name, "color", !!cam && (view === "both" || view === "color"), 120, bump, true);
+  const depthSrc = useFrame(name, "depth", !!cam && (view === "both" || view === "depth"), 120, bump, true);
 
   // ---- things on the desk ----
   const tracks = useTracks(cam && cam.ok && !cam.error ? cam.objects : [], cam ? cam.fps : 0);
@@ -135,6 +143,10 @@ export default function DeskView({ st, busy, bump, onNotice }) {
   if (game) say.push("let’s play shell game");
   const prefix = sayPrefix(st);
 
+  // where a grab is, as the router reports it ("look" → "reach" → "grip" → "lift" → "deliver" → "done")
+  const stageAt = STAGES.findIndex((sg) => sg.id === st.stage);
+  const grabbing = (st.phase === "running" && stageAt >= 0) || (st.phase === "done" && st.stage === "done");
+
   const named = tracks.filter((t) => t.named), unnamed = tracks.filter((t) => !t.named);
   const seenN = tracks.filter((t) => t.seen).length;
   const nm = cam.naming;
@@ -210,7 +222,18 @@ export default function DeskView({ st, busy, bump, onNotice }) {
         )}
       </div>
 
-      {say.length > 0 && (
+      {grabbing ? (
+        <ol className="stages" aria-label="Grab progress">
+          {STAGES.map((sg, i) => {
+            const state = stageAt > i || st.stage === "done" ? "done" : stageAt === i ? "now" : "";
+            return (
+              <li key={sg.id} className={`stage${state ? " stage--" + state : ""}`} aria-current={state === "now" ? "step" : undefined}>
+                <span className="stage__dot">{state === "done" ? <Check size={12} /> : i + 1}</span>{sg.label}
+              </li>
+            );
+          })}
+        </ol>
+      ) : say.length > 0 && (
         <div className="say">
           <div className="eyebrow">Try saying</div>
           <div className="say__chips">

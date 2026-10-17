@@ -8,7 +8,7 @@ import { roleFor, armKey, isGameCommand } from "./roles.js";
 function ArmCard({ arm, arms, cam, busy, bump }) {
   const { role, blurb } = roleFor(arm, arms);
   const camName = cam && !cam.error ? cam.name : null;
-  const src = useFrame(camName, "color", true, 450, bump);
+  const src = useFrame(camName, "color", true, 600, bump); // a thumbnail: color-only preview
   const [btnBusy, setBtnBusy] = useState(false);
   const [err, setErr] = useState("");
 

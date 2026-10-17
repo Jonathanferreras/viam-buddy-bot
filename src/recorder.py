@@ -7,6 +7,10 @@ Records a camera while a voice command has the robot moving, and saves an .mp4 p
     frames are thrown away, so a "grab" that found nothing doesn't leave an empty clip behind.
     Another command while a clip is running just extends that clip.
 
+    Arm state comes from `probe` when one is set (the router's shared poller), so recorders don't each
+    flood the arms with their own requests. A check that fails or is stale counts as "don't know",
+    which keeps the clip rolling rather than ending it: a slow network must not cut a video short.
+
 Clips land in <project>/recordings/YYYY-MM-DD_HH-MM-SS_<command>.mp4 with a .json beside it.
 Encoding uses ffmpeg: Homebrew's if it's installed, else the one bundled with the imageio-ffmpeg
 package (pip-installed into the module's venv the first time). Without either, the JPEG frames are
@@ -127,6 +131,9 @@ class Recorder:
         self.camera_name = ""
         self.arms: Dict[str, Any] = {}           # resource name -> Arm
         self.busy: Callable[[], bool] = lambda: False
+        # rn -> (moving, joints) from a shared poller, or None if it has nothing recent; unset: ask the arm
+        self.probe: Optional[Callable[[str], Optional[tuple]]] = None
+        self.workers = 3          # frame requests kept in flight (each one is a round trip to the camera)
         self._task: Optional[asyncio.Task] = None
         self._session: Optional[Dict[str, Any]] = None
         self.last: Optional[Dict[str, Any]] = None    # the last saved clip (for the status page)
@@ -289,13 +296,30 @@ class Recorder:
         finally:
             self._session = None if self._session is s else self._session
 
-    async def _arm_moved(self, rn: str, arm, s: Dict[str, Any]) -> bool:
+    def mark_moved(self) -> None:
+        """The command this clip films did move an arm (said by the router once it finishes), so the clip is
+        kept even if every motion check happened to fail."""
+        if self._session is not None:
+            self._session["moved"] = True
+            self._session["last_motion"] = time.time()
+
+    async def _arm_state(self, rn: str, arm) -> Optional[tuple]:
+        """(moving, joint values) or None when it can't be told right now."""
+        if self.probe is not None:
+            return self.probe(rn)
         try:
             moving, joints = await asyncio.wait_for(
                 asyncio.gather(arm.is_moving(), arm.get_joint_positions()), timeout=2)
         except Exception:
-            return False
-        vals = [float(v) for v in joints.values]
+            return None
+        return bool(moving), [float(v) for v in joints.values]
+
+    async def _arm_moved(self, rn: str, arm, s: Dict[str, Any]) -> Optional[bool]:
+        """True/False, or None when the arm couldn't be asked (that must not end a clip)."""
+        st = await self._arm_state(rn, arm)
+        if st is None:
+            return None
+        moving, vals = st
         prev = s["joints"].get(rn)
         s["joints"][rn] = vals
         changed = prev is not None and len(prev) == len(vals) and max(abs(a - b) for a, b in zip(prev, vals)) > 0.3
@@ -307,9 +331,11 @@ class Recorder:
             now = time.time()
             if self.arms:
                 moved = await asyncio.gather(*[self._arm_moved(rn, a, s) for rn, a in self.arms.items() if a is not None])
-                if any(moved):
+                if any(m is True for m in moved):
                     s["moved"] = True
                     s["last_motion"] = time.time()
+                elif any(m is None for m in moved):
+                    s["last_motion"] = time.time()   # can't tell: keep rolling (max_s still caps it)
             busy = False
             try:
                 busy = bool(self.busy())
@@ -378,7 +404,7 @@ class Recorder:
                 s["times"].append(time.time())
                 await asyncio.to_thread(_write, os.path.join(s["dir"], f"f{s['n']:06d}.jpg"), jpeg)
 
-        workers = [asyncio.get_event_loop().create_task(worker()) for _ in range(6)]
+        workers = [asyncio.get_event_loop().create_task(worker()) for _ in range(max(1, int(self.workers)))]
         try:
             await asyncio.gather(*workers)
         finally:
@@ -469,10 +495,11 @@ class MotionRecorder:
         self.labels: Dict[str, str] = {}       # resource name -> "arm 18"
         self._task: Optional[asyncio.Task] = None
 
-    def configure(self, camera, camera_name: str, arms: Dict[str, Any], labels: Dict[str, str]) -> None:
+    def configure(self, camera, camera_name: str, arms: Dict[str, Any], labels: Dict[str, str],
+                  busy: Optional[Callable[[], bool]] = None) -> None:
         self.arms = {k: a for k, a in arms.items() if a is not None}
         self.labels = labels
-        self.rec.configure(camera, camera_name, self.arms, lambda: False)
+        self.rec.configure(camera, camera_name, self.arms, busy or (lambda: False))
         self.close()
         self._task = (asyncio.get_event_loop().create_task(self._watch())
                       if camera is not None and self.arms else None)
@@ -482,6 +509,16 @@ class MotionRecorder:
             self._task.cancel()
 
     async def _moving(self, rn: str, arm, prev: Dict[str, List[float]], fails: Dict[str, int]) -> bool:
+        if self.rec.probe is not None:
+            st = self.rec.probe(rn)
+            if st is None:
+                prev.pop(rn, None)
+                return False
+            moving, vals = st
+            old = prev.get(rn)
+            prev[rn] = vals
+            return bool(moving) or (old is not None and len(old) == len(vals)
+                                    and max(abs(a - b) for a, b in zip(old, vals)) > 0.3)
         try:
             moving, joints = await asyncio.wait_for(asyncio.gather(arm.is_moving(), arm.get_joint_positions()), timeout=3)
         except asyncio.CancelledError:

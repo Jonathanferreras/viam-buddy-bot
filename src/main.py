@@ -476,6 +476,10 @@ class VoiceRouter(Generic, EasyResource):
                 "on_mat_min": 0.35 if vis.get("require_on_mat", True) else 0.0,
                 "approach_mm": float(vis.get("approach_mm", 120)),
                 "lift_mm": float(vis.get("lift_mm", 150)),
+                # joint speeds for straight-line moves: travelling in the air, and the last bit down/up
+                "travel_speed": float(vis.get("travel_speed_deg_s", 90)),
+                "approach_speed": float(vis.get("approach_speed_deg_s", 40)),
+                "normal_speed": float(vis.get("normal_speed_deg_s", 60)),   # the arms' configured speed
                 "safe_z_mm": vis.get("safe_z_mm"),          # travel height; default derived from calibration
                 "reach_min_mm": float(vis.get("reach_min_mm", 150)),
                 "reach_max_mm": float(vis.get("reach_max_mm", 750)),
@@ -574,6 +578,8 @@ class VoiceRouter(Generic, EasyResource):
         self.live_range = (float(rng[0]), float(rng[1])) if rng and len(rng) == 2 else None
         self._live_last: Dict[str, Dict[str, Any]] = {}   # camera -> latest frame, intrinsics, arm pose
         self._det_n: Dict[str, int] = {}                     # camera -> detections made so far
+        self._det_at: Dict[str, float] = {}                  # camera -> time of its latest detection
+        self._full_since: Dict[str, Optional[float]] = {}    # camera -> since when it's been running in full
         status_page.set_live_cams([c["camera"] for c in self.live_cams])
         for c in self.live_cams:
             status_page.set_live_status(c["camera"], camera=c["camera"], label=c["label"], arm=c["arm_label"],
@@ -587,6 +593,7 @@ class VoiceRouter(Generic, EasyResource):
         self._arms = self._collect_arms(dependencies)
         self._arm_state: Dict[str, Dict[str, Any]] = {}
         self._action_arms: List[str] = []   # arms the running voice command is driving
+        self._stage: Optional[str] = None   # where a grab is: look, reach, grip, lift, deliver, done
         global _ARMS_TASK
         if _ARMS_TASK is not None and not _ARMS_TASK.done():
             _ARMS_TASK.cancel()
@@ -622,6 +629,7 @@ class VoiceRouter(Generic, EasyResource):
         arms = {rn: a["arm"] for rn, a in self._arms.items() if a.get("arm") is not None}
         _REC.configure(cam, cfg["camera"], arms,
                        lambda: self._action_task is not None and not self._action_task.done())
+        _REC.probe = self._arm_probe
 
     def _setup_motion_recorders(self, specs: List[Dict[str, Any]], deps: Mapping[ResourceName, ResourceBase]) -> None:
         """Film a camera whenever an arm moves, whatever moved it (not just voice commands)."""
@@ -648,12 +656,27 @@ class VoiceRouter(Generic, EasyResource):
                 LOGGER.warning(f"recording: {', '.join(missing)} isn't available; {label} "
                                f"won't be filmed when {' or '.join(arm_names)} moves")
             labels = {a: (self._arms.get(a) or {}).get("name") or a for a in arm_names}
-            mr.configure(cam, cam_name, arms, labels)
+            # while a command is driving one of these arms the clip keeps rolling, however long the arm
+            # takes to get going (looking, planning, a slow network)
+            mr.configure(cam, cam_name, arms, labels,
+                         busy=lambda mine=frozenset(arm_names): self._action_task is not None
+                         and not self._action_task.done() and bool(mine & set(self._action_arms or [])))
+            mr.rec.probe = self._arm_probe
             wanted[cam_name] = mr
         for name, mr in _MOTION_RECS.items():
             if name not in wanted:
                 mr.close()
         _MOTION_RECS = wanted
+
+    def _rec_moved(self) -> None:
+        """A command finished having moved its arms: the clips filming them are worth keeping."""
+        mine = set(self._action_arms or [])
+        recs = ([_REC] if _REC is not None else []) + [mr.rec for mr in _MOTION_RECS.values() if mine & set(mr.arms)]
+        for r in recs:
+            try:
+                r.mark_moved()
+            except Exception:
+                pass
 
     def _rec_statuses(self) -> List[Dict[str, Any]]:
         recs = [_REC] if _REC is not None and _REC.camera is not None else []
@@ -721,14 +744,20 @@ class VoiceRouter(Generic, EasyResource):
             st.update(ok=False, error=str(e) or type(e).__name__)
 
     async def _arms_forever(self):
-        """Ask each arm whether it's moving (and where its joints are) ~3x/second, only while a page is open."""
+        """Ask each arm whether it's moving (and where its joints are) ~4x/second. This is the one place
+        that asks: the status page and every recorder read its results (_arm_probe), instead of each
+        polling the arms over the network on its own."""
         while True:
-            if not status_page.page_open():
-                await asyncio.sleep(0.3)
-                continue
             t0 = time.time()
             await asyncio.gather(*[self._poll_arm(rn, a) for rn, a in self._arms.items()], return_exceptions=True)
-            await asyncio.sleep(max(0.1, 0.33 - (time.time() - t0)))
+            await asyncio.sleep(max(0.1, 0.25 - (time.time() - t0)))
+
+    def _arm_probe(self, rn: str) -> Optional[tuple]:
+        """(moving, joints) from the shared poller, or None when it has no recent reading for that arm."""
+        st = self._arm_state.get(rn) or {}
+        if not st.get("ok") or time.time() - st.get("at", 0) > 1.5:
+            return None
+        return bool(st.get("moving")), list(st.get("joints") or [])
 
     def _arms_snapshot(self) -> List[Dict[str, Any]]:
         running = self._action_task is not None and not self._action_task.done()
@@ -750,6 +779,14 @@ class VoiceRouter(Generic, EasyResource):
         return out
 
     # ---------- live camera for the status page ----------
+
+    @staticmethod
+    async def _color_only(cam):
+        """Just the color picture from a color+depth camera."""
+        try:
+            return await cam.get_images(filter_source_names=["color"])
+        except TypeError:   # an older SDK without the filter
+            return await cam.get_images()
 
     @staticmethod
     def _detect_live(out: Dict[str, Any], intr: Dict[str, float], colors: Dict[str, Any]) -> Dict[str, Any]:
@@ -780,8 +817,32 @@ class VoiceRouter(Generic, EasyResource):
                 stamps.clear()
                 await asyncio.sleep(0.2)
                 continue
+            full = status_page.live_full(name)
+            if not full:
+                self._full_since[name] = None
+            elif not self._full_since.get(name):
+                self._full_since[name] = time.time()
             t0 = time.time()
             try:
+                if not full:
+                    # only a preview is showing it: color alone, ~2 a second, no depth, no detection.
+                    # (A wrist camera's raw depth is ~1.8 MB a frame; pulling it for a thumbnail is what
+                    # was swamping the connection to the arms.)
+                    res = await asyncio.wait_for(self._color_only(cam), timeout=6)
+                    named = res[0] if isinstance(res, tuple) else res
+                    out = await asyncio.to_thread(vision.render_live, named, rng, self.live_range)
+                    status_page.set_live_frame(out["color"], out["depth"], out["depth_mm"], name)
+                    stamps.append(time.time())
+                    span = stamps[-1] - stamps[0]
+                    status_page.set_live_status(
+                        name, ok=True, paused=False, error=None, objects=[], preview=True,
+                        fps=round((len(stamps) - 1) / span, 1) if span > 0 else 0,
+                        has_color=out["color"] is not None, size=out["size"])
+                    if failing:
+                        LOGGER.info(f"live camera {name} is back")
+                    failing = False
+                    await asyncio.sleep(max(0.0, max(period, 0.5) - (time.time() - t0)))
+                    continue
                 if arm is not None:   # the picture and where the arm was, as close together as we can
                     res, pose = await asyncio.gather(asyncio.wait_for(cam.get_images(), timeout=6),
                                                      asyncio.wait_for(arm.get_end_position(), timeout=6),
@@ -815,8 +876,9 @@ class VoiceRouter(Generic, EasyResource):
                                              c.get("min_size_mm", 20))
                         objs = namer.label(tracker.update(inside), out["color"])
                         status_page.set_live_status(name, table=found["table"], objects=objs, detect_error=None,
-                                                    naming=namer.status())
+                                                    naming=namer.status(), preview=False)
                         self._det_n[name] = self._det_n.get(name, 0) + 1
+                        self._det_at[name] = time.time()
                     except Exception as e:
                         status_page.set_live_status(name, objects=[], detect_error=str(e) or type(e).__name__)
                 elif intr_err:
@@ -931,6 +993,7 @@ class VoiceRouter(Generic, EasyResource):
             "phase": phase,
             "mic": self._mic_state(),
             "current": self._current,
+            "stage": self._stage,
             "commands": [c["phrases"][0] for c in self.commands],
             "command_list": [{"label": self._label(c), "phrases": c["phrases"]} for c in self.commands],
             "history": list(reversed(self._history)),
@@ -1413,6 +1476,7 @@ class VoiceRouter(Generic, EasyResource):
             return {"heard": text, "matched": True, "skipped": "previous command still running"}
 
         # Run in the background so the listener stays free to hear "stop".
+        self._stage = None
         self._set_phase("running", current=label)
         self._action_arms = self._arms_for(cmd)
         self._action_task = asyncio.get_event_loop().create_task(self._run(cmd, text, label))
@@ -1440,6 +1504,10 @@ class VoiceRouter(Generic, EasyResource):
                 else:
                     await cmd["resource"].do_command(cmd["command"])
             self._record(heard=text, **cmd.get("rec", {}), matched=True, label=label)
+            if cmd["action"] not in ("release", "stop"):
+                self._rec_moved()
+            if self._stage:
+                self._stage = "done"
             self._set_phase("done", hold_s=3,
                             current=self._current if cmd["action"] in ("grab", "release", "pick", "find_grab") else None)
             self._play("done")
@@ -1850,6 +1918,10 @@ class VoiceRouter(Generic, EasyResource):
         """What a live camera sees, from detections made after now (the camera is woken up if no page is
         watching it; two frames, because a thing is only listed once it's been seen twice)."""
         name = c["camera"]
+        status_page.want_live(name)
+        since = self._full_since.get(name)
+        if since and time.time() - since > 1.5 and time.time() - self._det_at.get(name, 0) < 0.8:
+            return list(status_page.live_status(name).get("objects") or [])   # already current
         start, t0 = self._det_n.get(name, 0), time.time()
         while time.time() - t0 < timeout:
             status_page.want_live(name)
@@ -1920,6 +1992,7 @@ class VoiceRouter(Generic, EasyResource):
         what = cmd.get("what") or " ".join(x for x in (color, noun) if x)
         self._action_arms = [g["key"]]
         self._set_phase("running", current=f"{name} is looking for the {what}")
+        self._stage = "look"
         if which is not None:
             # "white cup 2": the numbers are the ones the page shows, counted left to right in the desk
             # camera's picture, so look there (and let its calibration pick the arm), not through the wrist
@@ -1961,6 +2034,7 @@ class VoiceRouter(Generic, EasyResource):
             raise ValueError(f"{_cap(g['name'])} is already holding the {g['holding']} — say “let go” first")
         self._action_arms = [g["key"]]
         self._set_phase("running", current=f"{_cap(g['name'])} is reaching for the {what}")
+        self._stage = "reach"
         if info.get("via") == "wrist":
             p, why = self._wrist_point(obj, c)
             if p is None:
@@ -2110,6 +2184,7 @@ class VoiceRouter(Generic, EasyResource):
 
         # open, rise to a safe height where we are, travel above the target, come straight down
         self._set_phase("running", current=f"{name} is reaching for the {what}")
+        self._stage = "reach"
         await gripper.open()
         here = await arm.get_end_position()
         if here.z < safe_z - 5:
@@ -2120,7 +2195,9 @@ class VoiceRouter(Generic, EasyResource):
 
         # grab and check we actually caught it
         self._set_phase("running", current=f"{name} is grabbing the {what}")
+        self._stage = "grip"
         caught = await self._squeeze(g)
+        self._stage = "lift"
         await arm.move_to_position(pose(target[0], target[1], target[2] + v["lift_mm"]))
         if not caught:
             await gripper.open()
@@ -2132,7 +2209,8 @@ class VoiceRouter(Generic, EasyResource):
         handoff = self._poses.get(self._handoff_key(g))
         if handoff:
             self._set_phase("running", current=f"{name} is bringing you the {what}")
-            await arm.move_to_joint_positions(JointPositions(values=[float(j) for j in handoff["joints"]]))
+            self._stage = "deliver"
+            await self._move_line(arm, [[float(j) for j in handoff["joints"]]], self._travel_speed())
         self._current = f"{name} is holding the {what} — say “let go”"
         return {"grabbed": what, "arm": g["name"], "at": target}
 
@@ -2162,8 +2240,51 @@ class VoiceRouter(Generic, EasyResource):
         g["ik_ok"] = True
         return q
 
-    async def _move_line(self, arm, path: List[List[float]]) -> None:
-        await arm.move_through_joint_positions([JointPositions(values=w) for w in path])
+    async def _move_line(self, arm, path: List[List[float]], speed: Optional[float] = None) -> None:
+        """Follow joint waypoints. `speed` (deg/s) applies to this move only: the xArm driver takes it as
+        DoCommand set_speed, and its normal speed is put back afterwards (even after a "stop")."""
+        wps = [JointPositions(values=w) for w in path]
+        if not speed:
+            await arm.move_through_joint_positions(wps)
+            return
+        await self._set_speed(arm, speed)
+        try:
+            await arm.move_through_joint_positions(wps)
+        finally:
+            try:
+                await asyncio.shield(self._set_speed(arm, (self.vision or {}).get("normal_speed", 60.0)))
+            except BaseException:
+                pass
+
+    async def _set_speed(self, arm, v: float) -> None:
+        try:
+            await asyncio.wait_for(arm.do_command({"set_speed": float(v)}), timeout=3)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if not getattr(self, "_speed_warned", False):
+                self._speed_warned = True
+                LOGGER.warning(f"couldn't set the arm's speed ({_friendly_error(e)}); it'll move at its configured speed")
+
+    def _travel_speed(self) -> Optional[float]:
+        return (self.vision or {}).get("travel_speed")
+
+    def _approach_speed(self) -> Optional[float]:
+        return (self.vision or {}).get("approach_speed")
+
+    async def _straight_up(self, g: Optional[Dict[str, Any]], z: float) -> Optional[List[List[float]]]:
+        """Joint waypoints lifting arm `g` straight up to flange height z (no planner), or None."""
+        if g is None:
+            return None
+        q0 = await self._ik_ready(g)
+        if q0 is None:
+            return None
+        import numpy as np
+        T = kin.fk(q0).copy()
+        if T[2, 3] >= z - 5:
+            return []
+        T[2, 3] = z
+        return await asyncio.to_thread(kin.line, q0, T, 25.0)
 
     async def _pick(self, g: Dict[str, Any], cam_mm: List[float], what: str) -> Dict[str, Any]:
         return await self._grab_then_reset(g, self._pick_steps(g, cam_mm, what))
@@ -2200,6 +2321,8 @@ class VoiceRouter(Generic, EasyResource):
             raise
         if not self._poses.get(self._handoff_key(g)) and g["holding"]:
             held = g["holding"]
+            self._stage = "deliver"
+            self._set_phase("running", current=f"{_cap(g['name'])} is bringing you the {held}")
             if await self._return_home(g):
                 self._current = f"{_cap(g['name'])} is holding the {held} — say “let go”"
         return res
@@ -2244,6 +2367,7 @@ class VoiceRouter(Generic, EasyResource):
 
         above = grip_z + v["approach_mm"]
         self._set_phase("running", current=f"{name} is reaching for the {what}")
+        self._stage = "reach"
         await gripper.open()
         if here.z < above + tcp - 5:   # rise straight up first if we're lower than the approach height
             await arm.move_to_position(Pose(x=here.x, y=here.y, z=above + tcp, o_x=here.o_x, o_y=here.o_y,
@@ -2252,7 +2376,9 @@ class VoiceRouter(Generic, EasyResource):
         await arm.move_to_position(flange(grip_z))
 
         self._set_phase("running", current=f"{name} is grabbing the {what}")
+        self._stage = "grip"
         caught = await self._squeeze(g)
+        self._stage = "lift"
         await arm.move_to_position(flange(grip_z + v["lift_mm"]))
         if not caught:
             await gripper.open()
@@ -2262,7 +2388,8 @@ class VoiceRouter(Generic, EasyResource):
         handoff = self._poses.get(self._handoff_key(g))
         if handoff:
             self._set_phase("running", current=f"{name} is bringing you the {what}")
-            await arm.move_to_joint_positions(JointPositions(values=[float(j) for j in handoff["joints"]]))
+            self._stage = "deliver"
+            await self._move_line(arm, [[float(j) for j in handoff["joints"]]], self._travel_speed())
         self._current = f"{name} is holding the {what} — say “let go”"
         return {"grabbed": what, "arm": g["name"], "at": [x, y, grip_z]}
 
@@ -2304,7 +2431,8 @@ class VoiceRouter(Generic, EasyResource):
                     return None, None, None
                 pts += rise
                 q = rise[-1]
-            travel = kin.line(q, T_above)
+            # in the air: fewer, longer steps make a smoother, quicker move; fall back to fine steps
+            travel = kin.line(q, T_above, step_mm=35.0, step_deg=10.0) or kin.line(q, T_above)
             if travel is None:
                 return None, None, None
             pts += travel
@@ -2322,11 +2450,14 @@ class VoiceRouter(Generic, EasyResource):
         LOGGER.info(f"{name}: {what} at ({x:.0f}, {y:.0f}), about {height_mm:.0f} mm tall; fingertips to z={grip_z:.0f}, "
                     f"wrist at {turn:.0f}°" + (" (across its long side)" if axis else "") + " — straight moves, no planner")
         self._set_phase("running", current=f"{name} is reaching for the {what}")
-        await asyncio.gather(gripper.open(), self._move_line(arm, travel))
-        await self._move_line(arm, down)
+        self._stage = "reach"
+        await asyncio.gather(gripper.open(), self._move_line(arm, travel, self._travel_speed()))
+        await self._move_line(arm, down, self._approach_speed())
         self._set_phase("running", current=f"{name} is grabbing the {what}")
+        self._stage = "grip"
         caught = await self._squeeze(g)
-        await self._move_line(arm, up)
+        self._stage = "lift"
+        await self._move_line(arm, up, self._approach_speed())
         if not caught:
             await gripper.open()
             raise ValueError(f"{name} missed the {what}: the gripper closed on nothing")
@@ -2334,7 +2465,8 @@ class VoiceRouter(Generic, EasyResource):
         handoff = self._poses.get(self._handoff_key(g))
         if handoff:
             self._set_phase("running", current=f"{name} is bringing you the {what}")
-            await arm.move_to_joint_positions(JointPositions(values=[float(j) for j in handoff["joints"]]))
+            self._stage = "deliver"
+            await self._move_line(arm, [[float(j) for j in handoff["joints"]]], self._travel_speed())
         self._current = f"{name} is holding the {what} — say “let go”"
         return {"grabbed": what, "arm": g["name"], "at": [x, y, grip_z], "straight": True}
 
@@ -2377,12 +2509,19 @@ class VoiceRouter(Generic, EasyResource):
             raise ValueError(f"the saved starting position for {name} doesn't match the arm; save it again")
         here = await arm.get_end_position()
         safe_z = float(cmd.get("safe_z_mm") or 300)
+        holding = self._stage == "deliver"      # bringing something back: keep the grab's wording
         if here.z < safe_z:
-            self._set_phase("running", current=f"Lifting {name}")
-            await arm.move_to_position(Pose(x=here.x, y=here.y, z=safe_z, o_x=here.o_x, o_y=here.o_y,
-                                            o_z=here.o_z, theta=here.theta))
-        self._set_phase("running", current=f"Resetting {name}")
-        await arm.move_to_joint_positions(JointPositions(values=target))
+            if not holding:
+                self._set_phase("running", current=f"Lifting {name}")
+            up = await self._straight_up(getattr(self, "grabbers", {}).get(cmd["resource_name"]), safe_z)
+            if up is None:   # our kinematics don't apply here: let the planner find a safe way up
+                await arm.move_to_position(Pose(x=here.x, y=here.y, z=safe_z, o_x=here.o_x, o_y=here.o_y,
+                                                o_z=here.o_z, theta=here.theta))
+            elif up:
+                await self._move_line(arm, up, self._approach_speed())
+        if not holding:
+            self._set_phase("running", current=f"Resetting {name}")
+        await self._move_line(arm, [target], self._travel_speed())
         return {"reset": cmd["resource_name"]}
 
     async def _wave(self, cmd: Dict[str, Any]) -> Dict[str, Any]:

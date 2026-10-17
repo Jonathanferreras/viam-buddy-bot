@@ -41,7 +41,9 @@ export function useLocal(key, initial) {
 }
 
 // ---- one camera picture, fetched a frame at a time (see status_page._live_frame) ----
-export function useFrame(cam, kind, active, intervalMs = 120, bump = 0) {
+// detect=true asks the router for this camera in full (depth + detections); without it a color-only
+// preview is enough, which keeps the network free for the arms.
+export function useFrame(cam, kind, active, intervalMs = 120, bump = 0, detect = false) {
   const [src, setSrc] = useState(null);
   useEffect(() => {
     if (!cam || !active) { setSrc(null); return; }
@@ -52,7 +54,7 @@ export function useFrame(cam, kind, active, intervalMs = 120, bump = 0) {
         if (document.hidden) { await sleep(500); continue; }
         const t0 = performance.now();
         try {
-          const r = await fetch(`/live/frame?cam=${enc}&kind=${kind}&have=${seq}`, { cache: "no-store" });
+          const r = await fetch(`/live/frame?cam=${enc}&kind=${kind}&have=${seq}${detect ? "&detect=1" : ""}`, { cache: "no-store" });
           if (r.status === 200 && !dead) {
             seq = +(r.headers.get("X-Seq") || -1);
             const u = URL.createObjectURL(await r.blob());
@@ -69,7 +71,7 @@ export function useFrame(cam, kind, active, intervalMs = 120, bump = 0) {
       if (url) setTimeout(() => URL.revokeObjectURL(url), 1000);
     })();
     return () => { dead = true; };
-  }, [cam, kind, active, intervalMs, bump]);
+  }, [cam, kind, active, intervalMs, bump, detect]);
   return src;
 }
 

@@ -94,8 +94,16 @@ def live_cams() -> List[str]:
 
 
 def want_live(which: Optional[str] = None) -> None:
-    """Ask for frames from this camera for the next couple of seconds, even with no page watching."""
-    _cam(which)["want_at"] = time.time()
+    """Ask for full frames (color, depth and detections) from this camera for the next couple of
+    seconds, even with no page watching."""
+    c = _cam(which)
+    c["want_at"] = c["full_at"] = time.time()
+
+
+def live_full(which: Optional[str] = None) -> bool:
+    """True when someone needs this camera's depth and detections (the page's selected camera, or a
+    grab that's looking); otherwise a color preview is enough and much lighter on the network."""
+    return time.time() - _cam(which).get("full_at", 0.0) < 2.5
 
 
 def live_wanted(which: Optional[str] = None) -> bool:
@@ -295,6 +303,8 @@ class _Handler(BaseHTTPRequestHandler):
         kind = "color" if q.get("kind", ["depth"])[0] == "color" else "depth"
         c = _cam(cam)
         c["want_at"] = time.time()
+        if kind == "depth" or q.get("detect", ["0"])[0] == "1":
+            c["full_at"] = c["want_at"]
         try:
             have = int(q.get("have", ["-1"])[0])
         except ValueError:
