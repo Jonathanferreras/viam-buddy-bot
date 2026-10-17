@@ -5,7 +5,7 @@ import { isGameCommand, wakeWord } from "./roles.js";
 // What the orb and the headline say in each phase the router reports. `W` is the wake word ("Hey buddy").
 const PHASES = (W) => ({
   starting:   { tone: "idle",  icon: "mic",    t: "Starting up…",               s: "Loading the speech model" },
-  waiting:    { tone: "wake",  icon: "mic",    t: `Say “${W}”`,                 s: "I’m listening. Ask me to grab something, or let’s play a game." },
+  waiting:    { tone: "wake",  icon: "mic",    t: `Say “${W}”`,                 s: "Ask me to grab something, or let’s play a game." },
   hearing:    { tone: "hear",  icon: "bars",   t: "I’m listening…",             s: "Go ahead — what do you need?" },
   processing: { tone: "think", icon: "bars",   t: "Understanding…",             s: "" },
   running:    { tone: "run",   icon: "bars",   t: "On it",                      s: `Say “${W}, stop” to halt` },
@@ -126,13 +126,14 @@ function Steps({ st, flow, micOn, W }) {
   );
 }
 
-export default function VoicePanel({ st, flow, levels, micOn, onToggleMic }) {
+// `say`: a few full phrases worth trying right now (shown while Buddy waits for the wake word).
+export default function VoicePanel({ st, flow, levels, micOn, onToggleMic, say = [] }) {
   const W = wakeWord(st);
   const P = PHASES(W);
   const phase = P[st.phase] ? st.phase : "starting";
   const p = P[phase];
   const toggle = micMode(st) === "toggle", mutable = canMute(st);
-  const game = phase === "running" && isGameCommand(st.current || (flow.cmd && flow.cmd.label));
+  const game = phase === "running" && isGameCommand(st.current || (flow.cmd && flow.cmd.label), st);
   const tone = game ? "game" : p.tone;
 
   const transcript = flow.cmd && flow.cmd.text && !["muted", "offline", "starting"].includes(phase);
@@ -162,6 +163,14 @@ export default function VoicePanel({ st, flow, levels, micOn, onToggleMic }) {
       </div>
       <div className="voice__sep" />
       <Steps st={st} flow={flow} micOn={micOn} W={W} />
+      {say.length > 0 && !["running", "muted", "offline", "starting"].includes(phase) && !transcript && (
+        <div className="say" aria-label="Try saying">
+          <div className="eyebrow">Try saying</div>
+          <div className="say__chips">
+            {say.map((s) => <span key={s} className="say__chip"><Mic size={14} />“{s}”</span>)}
+          </div>
+        </div>
+      )}
       {phase === "running" && (
         <div className="voice__stop">
           <Stop size={16} />

@@ -203,3 +203,39 @@ export function useKey(key, fn, deps = []) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 }
+
+// ---- within reach: one list of things, seen by the Helper's wrist camera and the desk camera ----
+// Each camera has its own tracks; here they're paired by name ("White cup 2" in both views, or the
+// only white cup each view sees) into one item per thing. Both feeds draw boxes for the same items,
+// each where its own camera sees them, and anything only one camera sees is still listed. A grab
+// goes through whichever view can reach it: the arm's own camera first, the desk camera's link second.
+export function useReach(wristCam, deskCam) {
+  const live = (c) => (c && c.ok && !c.error ? c.objects : []);
+  const wrist = useTracks(live(wristCam), wristCam ? wristCam.fps : 0);
+  const desk = useTracks(live(deskCam), deskCam ? deskCam.fps : 0);
+  const taken = new Set(), items = [];
+  const grabOf = (t, cam) => (t && cam && t.obj.grab && t.obj.grab.arm ? { cam: cam.name, obj: t.obj, info: t.obj.grab } : null);
+  const merge = (w, d) => {
+    const pick = w && w.named ? w : d && d.named ? d : w || d;   // the view that knows what it is names it
+    const ests = [w, d].filter((t) => t && t.estAt).map((t) => t.estAt);
+    return {
+      key: d ? `d${d.key}` : `w${w.key}`, label: pick.label, base: pick.base, n: pick.n, swatch: pick.swatch, named: pick.named,
+      seen: !!((w && w.seen) || (d && d.seen)), estAt: ests.length ? Math.min(...ests) : 0, sure: Math.max(w ? w.sure : 0, d ? d.sure : 0),
+      order: pick.order, wrist: w, desk: d, obj: pick.obj,
+      grab: grabOf(w, wristCam) || grabOf(d, deskCam) || null,
+      why: (w && w.obj.grab && w.obj.grab.why) || (d && d.obj.grab && d.obj.grab.why) || "",
+    };
+  };
+  for (const w of wrist) {
+    let d = desk.find((t) => !taken.has(t.key) && t.label === w.label);
+    if (!d) d = desk.find((t) => !taken.has(t.key) && t.base === w.base && (!t.n || !w.n));
+    if (d) taken.add(d.key);
+    items.push(merge(w, d));
+  }
+  for (const d of desk) if (!taken.has(d.key)) items.push(merge(null, d));
+  return items.sort((a, b) => {
+    if (!!a.estAt !== !!b.estAt) return a.estAt ? -1 : 1;
+    if (a.estAt) return a.estAt - b.estAt || a.order - b.order;
+    return b.sure - a.sure || a.order - b.order;
+  });
+}

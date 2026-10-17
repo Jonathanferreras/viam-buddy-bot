@@ -31,6 +31,14 @@ export function wakeWord(st) {
 // What to say before a command: nothing in tap-to-talk mode, the wake word otherwise.
 export const sayPrefix = (st) => ((st.mic && st.mic.mode) === "toggle" ? "" : `${wakeWord(st)}, `);
 
-// The game the Player runs. The router matches "play shell game" to a set phrase; when the
-// command that's running is the game, the page switches to the game accent.
-export const isGameCommand = (label) => /shell|game/i.test(label || "");
+// The game the Player runs. While a game step is running (the router's st.game.running), or the
+// command's label names the game, the page switches to the game accent.
+export const isGameCommand = (label, st) => !!(st && ((st.game && st.game.running) || (st.features && st.features.jenga && st.features.jenga.running)))
+  || /shell|game|jenga/i.test(label || "");
+
+// The cameras by job: the Helper's wrist camera, the Player's, and the overhead desk camera (no arm).
+export function camsByRole(st) {
+  const cams = (st && st.cams) || [], arms = (st && st.arms) || [];
+  const byRole = (role) => cams.find((c) => { const a = c.arm && arms.find((x) => x.name === c.arm); return a && roleFor(a, arms).role === role; }) || null;
+  return { helper: byRole("Helper"), player: byRole("Player"), desk: cams.find((c) => !c.arm) || null, cams, arms };
+}
