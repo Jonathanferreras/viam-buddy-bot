@@ -6,6 +6,7 @@ import { camLabel, roleFor, sayPrefix } from "./roles.js";
 
 // ---- one picture (color or depth) with its detection boxes and the hover readout ----
 function View({ kind, src, cam, boxes, probe, probeMM, waitTxt, onPick }) {
+  const a = cam.work_area; // [x0, y0, x1, y1] fractions of the picture, or null for the whole picture
   return (
     <figure className="view" data-kind={kind}>
       {src ? (
@@ -14,6 +15,11 @@ function View({ kind, src, cam, boxes, probe, probeMM, waitTxt, onPick }) {
         <div className="view__blank" />
       )}
       <div className="view__ov" aria-hidden="true">
+        {a && src && (
+          <div className="area" style={{ left: `${a[0] * 100}%`, top: `${a[1] * 100}%`, width: `${(a[2] - a[0]) * 100}%`, height: `${(a[3] - a[1]) * 100}%` }}>
+            <span>Within reach</span>
+          </div>
+        )}
         {boxes.map((b) => (
           <div key={b.key} className={`box${b.sel ? " sel" : ""}${b.hov ? " hov" : ""}${b.target ? " target" : ""}${b.low ? " low" : ""}`}
             style={{ left: `${b.l}%`, top: `${b.t}%`, width: `${b.w}%`, height: `${b.h}%` }} onClick={() => onPick(b.key)}>

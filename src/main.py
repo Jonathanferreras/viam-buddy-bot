@@ -26,6 +26,11 @@ Config attributes:
   "live_camera": "a17-depth-cam",            # optional: camera shown live on the status page
   "live_fps": 6,                             #   frames per second while a page is watching
   "live_depth_range_mm": [300, 1500],        #   optional fixed depth color range (default: auto)
+  "live_cameras": [                          # or several cameras; "arm" marks one mounted on that arm
+    {"camera": "a17-depth-cam", "label": "Table camera",
+     "work_area": [0, 0.33, 0.88, 1]},       #   only things inside this part of the picture count
+    {"camera": "a17-cam", "arm": "a17-arm", "label": "Arm 17 camera"}   # (fractions: x0, y0, x1, y1)
+  ],
   "record": {                               # optional: film a camera while a voice command moves an arm
     "camera": "a17-cam", "fps": 10,         #   saved to <project>/recordings/<time>_<command>.mp4
     "idle_s": 10, "max_s": 600              #   ends once no arm has moved for idle_s seconds
@@ -258,8 +263,36 @@ def _live_cam_specs(attrs: Dict[str, Any], vis: Dict[str, Any]) -> List[Dict[str
         if c["camera"] not in seen:
             seen.add(c["camera"])
             c["label"] = c.get("label") or ("Camera" if not out else c["camera"])
+            c["work_area"] = _work_area(c.get("work_area"), c["camera"])
             out.append(c)
     return out
+
+
+def _work_area(v: Any, camera: str) -> Optional[List[float]]:
+    """"work_area": [x0, y0, x1, y1] as fractions (0-1) of the camera picture; things whose centre falls
+    outside are ignored. None (or the whole picture) means no limit."""
+    if not v:
+        return None
+    try:
+        x0, y0, x1, y1 = (min(1.0, max(0.0, float(x))) for x in v)
+    except (TypeError, ValueError):
+        LOGGER.warning(f"live_cameras[{camera}].work_area must be [x0, y0, x1, y1] fractions; ignoring {v!r}")
+        return None
+    if x1 <= x0 or y1 <= y0:
+        LOGGER.warning(f"live_cameras[{camera}].work_area is empty ({v!r}); ignoring it")
+        return None
+    if (x0, y0, x1, y1) == (0.0, 0.0, 1.0, 1.0):
+        return None
+    return [x0, y0, x1, y1]
+
+
+def _in_work_area(objs: List[Dict[str, Any]], area: Optional[List[float]], size: Tuple[int, int]) -> List[Dict[str, Any]]:
+    """Only the detections whose centre lies inside the camera's work area (size = picture width, height)."""
+    if not area:
+        return objs
+    w, h = size
+    x0, y0, x1, y1 = area[0] * w, area[1] * h, area[2] * w, area[3] * h
+    return [o for o in objs if x0 <= o["uv"][0] <= x1 and y0 <= o["uv"][1] <= y1]
 
 
 def _find_arm(router: "VoiceRouter", name: str) -> Arm:
@@ -526,6 +559,7 @@ class VoiceRouter(Generic, EasyResource):
         status_page.set_live_cams([c["camera"] for c in self.live_cams])
         for c in self.live_cams:
             status_page.set_live_status(c["camera"], camera=c["camera"], label=c["label"], arm=c["arm_label"],
+                                        work_area=c.get("work_area"),
                                         ok=False, paused=False, fps=0, error=None, range_mm=None, has_color=None,
                                         size=None, table=None, objects=[], detect_error=None)
             _LIVE_TASKS.append(asyncio.get_event_loop().create_task(self._live_forever(c)))
@@ -758,7 +792,9 @@ class VoiceRouter(Generic, EasyResource):
                 if intr is not None and out["depth_mm"] is not None:
                     try:
                         found = await asyncio.to_thread(self._detect_live, out, intr, colors)
-                        objs = namer.label(tracker.update(found["objects"]), out["color"])
+                        h, w = out["depth_mm"].shape[:2]
+                        inside = _in_work_area(found["objects"], c.get("work_area"), (w, h))
+                        objs = namer.label(tracker.update(inside), out["color"])
                         status_page.set_live_status(name, table=found["table"], objects=objs, detect_error=None,
                                                     naming=namer.status())
                         self._det_n[name] = self._det_n.get(name, 0) + 1

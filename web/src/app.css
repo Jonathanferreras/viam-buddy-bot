@@ -180,6 +180,9 @@ button.orb__btn:focus-visible { outline: 3px solid var(--ink); outline-offset: 4
 .livebadge.on i { background: var(--green); animation: blink 2s ease-in-out infinite; }
 .livebadge.bad i { background: var(--red); }
 .livebadge .fps { color: var(--ink2); font-weight: 500; }
+/* the camera's work area: only things inside are detected; outside is dimmed */
+.area { position: absolute; border: 1.5px dashed rgba(255,255,255,.45); border-radius: 10px; box-shadow: 0 0 0 4000px rgba(0,0,0,.42); pointer-events: none; }
+.area span { position: absolute; left: 8px; bottom: 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: rgba(255,255,255,.6); }
 .box { position: absolute; border: 1.5px dashed rgba(255,255,255,.75); border-radius: 8px; pointer-events: auto; cursor: pointer; transition: border-color .15s; }
 .box b { position: absolute; left: -1.5px; bottom: 100%; margin-bottom: 4px; padding: 2px 8px; border-radius: 999px; background: rgba(28,28,30,.9); color: var(--ink); font-size: 12px; font-weight: 600; white-space: nowrap; opacity: 0; transition: opacity .15s; }
 .box.low b { bottom: auto; top: 100%; margin: 4px 0 0; }
