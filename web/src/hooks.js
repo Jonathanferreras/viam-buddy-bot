@@ -82,7 +82,8 @@ export function useFlow(state) {
   const [, force] = useState(0);
   useEffect(() => { const id = setInterval(() => force((n) => n + 1), 300); return () => clearInterval(id); }, []);
   const f = ref.current, ev = (state && state.events) || {}, now = Date.now(), phase = state ? state.phase : "";
-  if (f.seen === null) f.seen = { wake: ev.wake_seq, cmd: ev.cmd_seq };
+  if (!state) return { wakeOn: false, showCmd: false, act: false, outcome: null, cmd: null, typed: false, flash: false };
+  if (f.seen === null) f.seen = { wake: ev.wake_seq, cmd: ev.cmd_seq }; // first real state: no replay of old events
   if (ev.wake_seq !== f.seen.wake) {
     f.seen.wake = ev.wake_seq; f.wakeAt = now; f.cmd = null; f.cmdAt = 0; f.lastEvent = now; f.flashAt = now;
   }

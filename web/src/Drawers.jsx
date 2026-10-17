@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { getLogs, cap, isGeneric } from "./api.js";
 import { useLocal } from "./hooks.js";
 import { Close } from "./icons.jsx";
-import { roleFor } from "./roles.js";
+import { roleFor, wakeWord } from "./roles.js";
 
 const EXAMPLES = ["pick up the white cup", "get the red ball", "grab the yellow one", "hand me the cup", "drop it", "put it down",
                   "go back to the start", "reset arm 17", "wave arm 18", "let’s play shell game", "stop"];
@@ -21,7 +21,7 @@ export function CommandsDrawer({ st, onClose }) {
         <button type="button" className="drawer__x" aria-label="Close the commands" onClick={onClose}><Close size={18} /></button>
       </div>
       <div className="drawer__body">
-        <p className="lead">{toggle ? "Tap the mic, then say it." : "Say “Hey Viam”, then the command."} Exact words aren’t needed: say what you want, like the examples below.</p>
+        <p className="lead">{toggle ? "Tap the mic, then say it." : `Say “${wakeWord(st)}”, wait for the chime, then the command (you have ${(st.mic && st.mic.window_s) || 5} seconds).`} Exact words aren’t needed: say what you want, like the examples below.</p>
         {seen.length > 0 && (
           <>
             <h3>{who} can see</h3>

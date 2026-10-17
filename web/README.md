@@ -18,4 +18,4 @@ Layout: `src/App.jsx` (polling, shortcuts) → `TopBar`, `VoicePanel` (orb + Hey
 Action), `Buddies` (one card per arm: Helper, Player), `DeskView` (cameras, detections, hover depth,
 grab bar, “Within reach”), `Drawers` (what you can say, logs). Shared hooks in `src/hooks.js`.
 
-Keys: **M** mic on/off (toggle mode) · **C** commands · **L** logs · **Esc** stop all arms.
+Keys: **M** mute / unmute Buddy · **C** commands · **L** logs · **Esc** stop all arms.

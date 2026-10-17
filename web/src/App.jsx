@@ -29,12 +29,12 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const { rows: logRows, unseen: logUnseen } = useLogs(drawer === "logs");
 
-  // ---- mic switch (toggle mode): tap the orb or press M ----
+  // ---- mute switch: tap the orb or press M (wake mode mutes the wake word; toggle mode is tap-to-talk) ----
   const [micPending, setMicPending] = useState(null); // optimistic value while the click is on its way
   const raw = state || { phase: "starting" };
-  const st = micPending !== null && ["waiting", "muted"].includes(raw.phase) ? { ...raw, phase: micPending ? "waiting" : "muted" } : raw;
+  const st = micPending !== null && ["waiting", "muted", "hearing"].includes(raw.phase) ? { ...raw, phase: micPending ? "waiting" : "muted" } : raw;
   const micOn = micPending !== null ? micPending : !!(st.mic && st.mic.on);
-  const toggleMode = (st.mic && st.mic.mode) === "toggle";
+  const toggleMode = ["toggle", "wake"].includes(st.mic && st.mic.mode);
   async function toggleMic() {
     if (!toggleMode) return;
     const want = !micOn;

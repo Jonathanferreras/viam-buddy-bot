@@ -1,17 +1,27 @@
 """
-voice-router: a Viam generic service that turns "Hey Viam, <command>" into DoCommand calls.
+voice-router (Buddy Bot): a Viam generic service that turns "Hey buddy, <command>" into DoCommand calls.
 
-Pipeline on the machine:
-    system-audio microphone  ->  wake-word-filter ("hey viam")  ->  voice-router (this)
-The wake-word filter only yields audio spoken *after* the wake word, ending each
-utterance with an empty chunk. This service transcribes each utterance locally with
-Vosk, matches it against the configured commands, and calls DoCommand on the target.
+Pipeline on the machine (listen_mode "wake", the default):
+    system-audio microphone (raw_mic / level_mic)  ->  voice-router (this)
+The router transcribes the microphone locally with Vosk and watches for the wake word
+("hey buddy"). Once it hears it, it plays a chime and takes the next few seconds as the
+command; if nothing clear comes in time it plays the "off" chime and goes back to waiting
+for the wake word. A finished command plays the "done" chime. Any error is logged and
+the router goes back to waiting for the wake word. A mute switch on the status page (or
+DoCommand {"mic": false}) turns the wake word off; "stop" is still heard while an arm moves.
+
+Other modes: "wake_word" uses the external wake-word filter (self.mic) to decide when a
+command is being said; "toggle" is tap-to-talk from the status page.
 
 Config attributes:
 {
   "mic": "wake-mic",                         # audio_in (the wake-word filter)   [required]
   "vosk_model": "vosk-model-small-en-us-0.15",  # model name (auto-download) or local path
   "match_threshold": 80,                     # 0-100 fuzzy score needed to accept a match
+  "listen_mode": "wake",                     # "wake" (default) | "wake_word" (external filter) | "toggle"
+  "wake_word": "hey buddy",                  # what wakes Buddy up in "wake" mode
+  "command_window_s": 5,                     # seconds to say the command after the wake word
+  "sounds": true,                            # play the wake / timeout / done chimes (sounds/*.mp3)
   "use_grammar": true,                       # restrict Vosk to the command phrases (more accurate)
   "live_camera": "depth-cam",                # optional: camera shown live on the status page
   "live_fps": 6,                             #   frames per second while a page is watching
@@ -75,14 +85,14 @@ from viam.utils import ValueTypes, struct_to_dict
 
 from viam.proto.common import Pose
 
-from . import identify, kin, recorder, status_page, vision
+from . import identify, kin, recorder, sounds, status_page, vision
 
 LOGGER = getLogger(__name__)
 SAMPLE_RATE = 16000
 _ACTIVE_TASK: Optional[asyncio.Task] = None  # the one running listener in this process
 _LEVEL_TASK: Optional[asyncio.Task] = None   # the one running sound-level reader
 _LIVE_TASKS: List[asyncio.Task] = []         # the running live-camera readers (one per camera)
-_MIC = {"on": False}   # toggle-to-talk switch (starts off; survives config reloads)
+_MIC = {"on": None}   # mute switch; None until the first config picks the default (on in "wake" mode, off in "toggle")
 _ARMS_TASK: Optional[asyncio.Task] = None    # the one running arm-state poller (status page)
 _REC: Optional["recorder.Recorder"] = None   # records a camera while voice commands move the arms
 _MOTION_RECS: Dict[str, "recorder.MotionRecorder"] = {}   # camera -> films it whenever its arm moves
@@ -329,14 +339,21 @@ class VoiceRouter(Generic, EasyResource):
         attrs = struct_to_dict(config.attributes)
 
         self.mic: AudioIn = _find_dep(dependencies, attrs["mic"])  # type: ignore
-        # "toggle": tap the mic on the status page, then just say the command (default).
-        # "wake_word": always listening for "Hey Viam" through the wake-word filter (the old behaviour).
+        # "wake" (default): always listening on the raw mic for the wake word ("hey buddy"); once heard, the
+        #   next few seconds are taken as the command. The status page's mic button mutes it.
+        # "toggle": tap the mic on the status page, then just say the command.
+        # "wake_word": the external wake-word filter (self.mic) decides when a command is being said.
         raw_name = attrs.get("raw_mic") or attrs.get("level_mic")
         self.raw_mic: Optional[AudioIn] = _find_dep(dependencies, raw_name) if raw_name else None  # type: ignore
-        self.listen_mode = str(attrs.get("listen_mode", "toggle"))
-        if self.listen_mode == "toggle" and self.raw_mic is None:
-            LOGGER.warning("listen_mode 'toggle' needs 'raw_mic' (or 'level_mic'); falling back to the wake word")
+        self.listen_mode = str(attrs.get("listen_mode", "wake"))
+        if self.listen_mode in ("wake", "toggle") and self.raw_mic is None:
+            LOGGER.warning(f"listen_mode '{self.listen_mode}' needs 'raw_mic' (or 'level_mic'); falling back to the wake-word filter")
             self.listen_mode = "wake_word"
+        self.wake_word = " ".join(str(attrs.get("wake_word", "hey buddy")).lower().split()) or "hey buddy"
+        self.command_window_s = max(1.0, float(attrs.get("command_window_s", 5)))
+        self.sounds_on = bool(attrs.get("sounds", True))
+        if _MIC["on"] is None:
+            _MIC["on"] = self.listen_mode != "toggle"
         self.match_threshold = float(attrs.get("match_threshold", 80))
         self.use_grammar = bool(attrs.get("use_grammar", True))
         self.model_ref = attrs.get("vosk_model", "vosk-model-small-en-us-0.15")
@@ -433,8 +450,9 @@ class VoiceRouter(Generic, EasyResource):
         # For the status page: phase is one of starting, waiting, hearing, processing,
         # running, done, nomatch, error, offline. Result phases fall back to "waiting" after a few seconds.
         self._phase, self._phase_until, self._current = "starting", 0.0, None
+        self._listen_until = 0.0   # "wake" mode: the command window closes at this time
         self._history: deque = deque(maxlen=15)
-        # Counters the status page watches to light up "Hey Viam" and "Command" the moment they happen.
+        # Counters the status page watches to light up the wake word and "Command" the moment they happen.
         self._events: Dict[str, Any] = {"wake_seq": 0, "cmd_seq": 0, "cmd_text": None,
                                         "cmd_matched": None, "cmd_label": None, "cmd_typed": False}
         self._loop = asyncio.get_event_loop()
@@ -797,18 +815,28 @@ class VoiceRouter(Generic, EasyResource):
     def _idle_phase(self) -> str:
         if not self.state["listening"]:
             return "offline"
-        return "muted" if self.listen_mode == "toggle" and not _MIC["on"] else "waiting"
+        return "muted" if self.listen_mode in ("toggle", "wake") and not _MIC["on"] else "waiting"
 
     def _set_mic(self, on: bool) -> Dict[str, Any]:
         _MIC["on"] = bool(on)
-        LOGGER.info(f"microphone {'on' if on else 'off'}")
+        LOGGER.info("microphone " + ("on" if on else ("muted" if self.listen_mode == "wake" else "off")))
+        if not on:
+            self._listen_until = 0.0
         if self._phase in ("waiting", "muted", "hearing"):
             self._set_phase(self._idle_phase())
         return {"mic": _MIC["on"]}
 
     def _mic_state(self) -> Dict[str, Any]:
-        return {"mode": self.listen_mode, "on": _MIC["on"] if self.listen_mode == "toggle" else True,
-                "stop_only": self.listen_mode == "toggle" and not _MIC["on"] and self._voice_busy()}
+        mutable = self.listen_mode in ("toggle", "wake")
+        return {"mode": self.listen_mode, "on": bool(_MIC["on"]) if mutable else True,
+                "wake_word": self.wake_word, "window_s": self.command_window_s,
+                "listen_until": self._listen_until if self._phase == "hearing" and self._listen_until else None,
+                "stop_only": mutable and not _MIC["on"] and self._voice_busy()}
+
+    def _play(self, name: str) -> None:
+        """One of the UI chimes (sounds.py); silent when sounds are off in the config."""
+        if self.sounds_on:
+            sounds.play(name, LOGGER)
 
     def _voice_busy(self) -> bool:
         """A command started by voice is still running (so "stop" is still listened for)."""
@@ -971,6 +999,7 @@ class VoiceRouter(Generic, EasyResource):
                 vocab = sorted({p for c in cmds for p in c["phrases"]})
                 if only is None:     # words for free-form commands ("pick up the red ball"), usable in any order
                     vocab.append(" ".join(_NLU_WORDS))
+                    vocab.append(self.wake_word)   # "hey buddy", so the wake word can be recognised at all
                 return KaldiRecognizer(model, SAMPLE_RATE, json.dumps(vocab + ["[unk]"]))
             return KaldiRecognizer(model, SAMPLE_RATE)
 
@@ -1029,6 +1058,113 @@ class VoiceRouter(Generic, EasyResource):
                 LOGGER.warning(f"microphone stream ended ({e}); reconnecting in 2s")
                 await asyncio.sleep(2)
 
+    def _after_wake(self, text: str) -> Optional[str]:
+        """If `text` starts with the wake word (allowing for small mishearings: "hey body", "a buddy"),
+        return whatever follows it ("" if nothing); otherwise None."""
+        from rapidfuzz import fuzz
+        words = text.split()
+        n = len(self.wake_word.split())
+        if len(words) < n:
+            return None
+        for k in (n, n + 1, max(1, n - 1)):          # the wake word may come out as one word or three
+            head = " ".join(words[:k])
+            if fuzz.ratio(head, self.wake_word) >= 80:
+                return " ".join(words[k:])
+        return None
+
+    async def _wake_listen(self, make_recognizer):
+        """Buddy mode: transcribe the raw microphone and watch for the wake word ourselves.
+        wake word heard -> chime, "hearing" for command_window_s -> command routed, or the window
+        closes with the "off" chime and we're back to waiting for the wake word. Muted, nothing is
+        recognised except "stop" while an arm is moving. Any error logs and resets to waiting."""
+        try:   # the external wake-word filter isn't needed in this mode: stop it spending CPU
+            await self.mic.do_command({"pause_detection": None})
+        except Exception as e:
+            LOGGER.debug(f"couldn't pause the wake-word filter: {e}")
+        clean = lambda t: " ".join(t.replace("[unk]", " ").split())
+        while True:
+            try:
+                stream = await self.raw_mic.get_audio("pcm16", 0, 0)
+                self.state["listening"] = True
+                if self._phase in ("starting", "offline", "waiting", "muted"):
+                    self._set_phase(self._idle_phase())
+                LOGGER.info(f"voice-router: listening for '{self.wake_word}'")
+                rec, mode, woke_early = None, None, False
+                async for chunk in stream:
+                    data = chunk.audio.audio_data
+                    if not data:
+                        continue
+                    now = time.time()
+                    # the command window closed without a clear command
+                    if self._listen_until and now > self._listen_until:
+                        self._listen_until = 0.0
+                        woke_early = False
+                        rec = make_recognizer(None)
+                        LOGGER.info(f"no command within {self.command_window_s:.0f}s of '{self.wake_word}'")
+                        self._record(heard="(nothing)", matched=False)
+                        self._note_command("", None, typed=False)
+                        self._set_phase(self._idle_phase())
+                        self._play("wake_off")
+                    want = "all" if _MIC["on"] else ("stop" if self._voice_busy() else None)
+                    if want != mode:            # muted/unmuted, or an arm started/stopped moving
+                        mode, woke_early = want, False
+                        rec = None if want is None else make_recognizer(None if want == "all" else "stop")
+                    if rec is None:
+                        continue                # muted: audio is dropped, nothing is recognised
+                    if rec.AcceptWaveform(data):        # Vosk decided the utterance ended
+                        text = clean(json.loads(rec.Result()).get("text", ""))
+                        rec = make_recognizer(None if mode == "all" else "stop")
+                        if not text:
+                            continue
+                        if mode == "stop":      # muted, arm moving: only "stop" counts
+                            if self._match(text)[0] is not None:
+                                self._set_phase("processing")
+                                await self._route(text)
+                            continue
+                        if self._listen_until:  # inside the command window: this is the command
+                            self._listen_until = 0.0
+                            woke_early = False
+                            self._set_phase("processing")
+                            await self._route(text)
+                            continue
+                        rest = self._after_wake(text)
+                        if rest is None:        # ordinary talk, or the early partial was wrong
+                            if woke_early:
+                                woke_early = False
+                                self._set_phase(self._idle_phase())
+                                self._play("wake_off")
+                            continue
+                        if not woke_early:
+                            self._woke()
+                        woke_early = False
+                        if rest:                # "hey buddy grab the red ball" in one breath
+                            self._set_phase("processing")
+                            await self._route(rest)
+                        else:                   # just "hey buddy": the command comes next
+                            self._listen_until = time.time() + self.command_window_s
+                            self._set_phase("hearing")
+                    elif mode == "all" and not self._listen_until and not woke_early:
+                        partial = clean(json.loads(rec.PartialResult()).get("partial", ""))
+                        if partial and self._after_wake(partial) is not None:
+                            woke_early = True    # chime as soon as the words show up, before the pause
+                            self._woke()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.state["listening"] = False
+                self.state["last_error"] = str(e)
+                self._listen_until = 0.0
+                self._set_phase("offline")
+                LOGGER.warning(f"microphone stream ended ({e}); reconnecting in 2s")
+                await asyncio.sleep(2)
+
+    def _woke(self) -> None:
+        """The wake word was heard: light the page up and chime."""
+        self._events["wake_seq"] += 1
+        self._set_phase("hearing")
+        LOGGER.info(f"heard '{self.wake_word}'")
+        self._play("wake_on")
+
     async def _listen_forever(self):
         try:
             make_recognizer = await asyncio.to_thread(self._load_vosk)
@@ -1040,6 +1176,9 @@ class VoiceRouter(Generic, EasyResource):
 
         if self.listen_mode == "toggle":
             await self._toggle_listen(make_recognizer)
+            return
+        if self.listen_mode == "wake":
+            await self._wake_listen(make_recognizer)
             return
 
         while True:
@@ -1058,6 +1197,7 @@ class VoiceRouter(Generic, EasyResource):
                             in_segment = True
                             self._set_phase("hearing")
                             self._events["wake_seq"] += 1
+                            self._play("wake_on")
                         rec.AcceptWaveform(data)
                         continue
                     # Empty chunk = end of the utterance after the wake word.
@@ -1071,6 +1211,7 @@ class VoiceRouter(Generic, EasyResource):
                         self._record(heard="(nothing)", matched=False)
                         self._note_command("", None, typed=False)
                         self._set_phase("nomatch", hold_s=3)
+                        self._play("wake_off")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1166,6 +1307,7 @@ class VoiceRouter(Generic, EasyResource):
             self.state["last_match"] = None
             self._record(heard=text, matched=False)
             self._set_phase("nomatch", hold_s=4)
+            self._play("wake_off")
             return {"heard": text, "matched": False, "score": score}
 
         label = self._label(cmd)
@@ -1211,12 +1353,14 @@ class VoiceRouter(Generic, EasyResource):
             self._record(heard=text, **cmd.get("rec", {}), matched=True, label=label)
             self._set_phase("done", hold_s=3,
                             current=self._current if cmd["action"] in ("grab", "release", "pick", "find_grab") else None)
+            self._play("done")
         except asyncio.CancelledError:
             pass  # stopped on purpose; _stop records it
         except NotFound as e:
             LOGGER.info(str(e))
             self._record(heard=text, **cmd.get("rec", {}), matched=True, label="Not found", error=str(e), notfound=True)
             self._set_phase("notfound", hold_s=8, current=str(e))
+            self._play("wake_off")
         except Exception as e:
             why = _friendly_error(e)
             who = cmd.get("name") or cmd["resource_name"]
@@ -1224,6 +1368,7 @@ class VoiceRouter(Generic, EasyResource):
             LOGGER.error(self.state["last_error"] + (f"  ({e})" if why != str(e) else ""))
             self._record(heard=text, **cmd.get("rec", {}), matched=True, label=label, error=why)
             self._set_phase("error", hold_s=8)
+            self._play("wake_off")
 
     async def _stop(self, cmd: Dict[str, Any], text: str, label: str) -> Dict[str, Any]:
         """Cancel whatever is running and halt every listed arm where it is."""
@@ -1720,7 +1865,7 @@ class VoiceRouter(Generic, EasyResource):
     async def _grab_object(self, oid: int, cam_name: str = "") -> Dict[str, Any]:
         """Status page: an object was clicked in one of the cameras and "Grab" pressed. From the table
         camera the closest calibrated arm goes; from a wrist camera, the arm that camera is on.
-        Runs in the background like a voice command, so "Hey Viam, stop" halts it."""
+        Runs in the background like a voice command, so "Hey buddy, stop" halts it."""
         found = None
         for c in self.live_cams:
             if cam_name and c["camera"] != cam_name:
@@ -1733,7 +1878,7 @@ class VoiceRouter(Generic, EasyResource):
             raise ValueError("that object isn't on the table any more")
         c, obj = found
         if self._action_task is not None and not self._action_task.done():
-            raise ValueError("an arm is busy; wait for it to finish (or say “Hey Viam, stop”)")
+            raise ValueError("an arm is busy; wait for it to finish (or say “Hey buddy, stop”)")
         await asyncio.gather(*[self._sync_holding(g) for g in self.grabbers.values()])
         info = self._object_grab_info(obj, c)
         if not info:

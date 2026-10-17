@@ -1,34 +1,55 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Check, Alert, Play, Stop } from "./icons.jsx";
-import { isGameCommand } from "./roles.js";
+import { isGameCommand, wakeWord } from "./roles.js";
 
-// What the orb and the headline say in each phase the router reports.
-const PHASES = {
+// What the orb and the headline say in each phase the router reports. `W` is the wake word ("Hey buddy").
+const PHASES = (W) => ({
   starting:   { tone: "idle",  icon: "mic",    t: "Starting up…",               s: "Loading the speech model" },
-  waiting:    { tone: "wake",  icon: "mic",    t: "Say “Hey Viam”",             s: "I’m listening. Ask me to grab something, or let’s play a game." },
-  hearing:    { tone: "hear",  icon: "bars",   t: "I’m listening…",             s: "Heard “Hey Viam” — say your command" },
+  waiting:    { tone: "wake",  icon: "mic",    t: `Say “${W}”`,                 s: "I’m listening. Ask me to grab something, or let’s play a game." },
+  hearing:    { tone: "hear",  icon: "bars",   t: "I’m listening…",             s: "Go ahead — what do you need?" },
   processing: { tone: "think", icon: "bars",   t: "Understanding…",             s: "" },
-  running:    { tone: "run",   icon: "bars",   t: "On it",                      s: "Say “Hey Viam, stop” to halt" },
+  running:    { tone: "run",   icon: "bars",   t: "On it",                      s: `Say “${W}, stop” to halt` },
   done:       { tone: "run",   icon: "check",  t: "Done",                       s: "" },
   stopped:    { tone: "think", icon: "stop",   t: "Stopped",                    s: "Arms halted where they are" },
-  nomatch:    { tone: "bad",   icon: "alert",  t: "Didn’t catch a command",     s: "Try again: “Hey Viam”, then the command" },
+  nomatch:    { tone: "bad",   icon: "alert",  t: "Didn’t catch that",          s: `Try again: “${W}”, then the command` },
   notfound:   { tone: "bad",   icon: "alert",  t: "Couldn’t find it",           s: "Check it’s on the desk and in the camera’s view" },
   error:      { tone: "bad",   icon: "alert",  t: "Something went wrong",       s: "" },
   offline:    { tone: "bad",   icon: "mic",    t: "Microphone not connected",   s: "Retrying…" },
-  muted:      { tone: "idle",  icon: "micoff", t: "Mic is off",                 s: "Tap the mic, then say a command" },
-};
+  muted:      { tone: "idle",  icon: "micoff", t: "Buddy is muted",             s: `Tap the mic and I’ll listen for “${W}” again` },
+});
 const TOGGLE_TEXT = {
   waiting: { t: "Listening", s: "Say a command, like “grab the red ball”" },
   hearing: { t: "I’m listening…", s: "Go ahead — I’ll act when you pause" },
   running: { s: "Say “stop” to halt" },
+  muted: { t: "Mic is off", s: "Tap the mic, then say a command" },
 };
 const micMode = (st) => (st.mic && st.mic.mode) || "wake_word";
+const canMute = (st) => ["toggle", "wake"].includes(micMode(st));
 
 function micText(st, micOn, phase, key, dflt) {
+  if (phase === "running" && canMute(st) && !micOn && key === "s")
+    return st.mic && st.mic.stop_only ? "Muted — it still hears “stop” while the arm moves" : "Tap the mic and say “stop” to halt it";
   if (micMode(st) !== "toggle") return dflt;
-  if (phase === "running" && !micOn && key === "s")
-    return st.mic && st.mic.stop_only ? "Mic’s off — it still hears “stop” while the arm moves" : "Tap the mic and say “stop” to halt it";
   return (TOGGLE_TEXT[phase] && TOGGLE_TEXT[phase][key]) || dflt;
+}
+
+// The seconds Buddy waits for a command after the wake word, drawn as a draining bar.
+function Countdown({ active, seconds }) {
+  const [since, setSince] = useState(0);
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!active) { setSince(0); return; }
+    setSince(Date.now());
+    const id = setInterval(() => tick((n) => n + 1), 100);
+    return () => clearInterval(id);
+  }, [active]);
+  if (!active || !since) return null;
+  const left = Math.max(0, 1 - (Date.now() - since) / (seconds * 1000));
+  return (
+    <div className="countdown" role="timer" aria-label={`${Math.ceil(left * seconds)} seconds to say a command`}>
+      <i style={{ transform: `scaleX(${left.toFixed(3)})` }} />
+    </div>
+  );
 }
 
 // ---- the orb: color by phase, size and bars by the live mic level ----
@@ -63,13 +84,13 @@ function Orb({ tone, icon, levels, toggle, on, onToggle }) {
     : icon === "stop" ? <Stop size={40} />
     : icon === "micoff" ? <MicOff size={44} />
     : <Mic size={44} />;
-  const label = toggle ? (on ? "Microphone on — tap to turn off" : "Microphone off — tap to talk") : "Voice status";
+  const label = toggle ? (on ? "Buddy is listening — tap to mute" : "Buddy is muted — tap to listen") : "Voice status";
   return (
     <div ref={ref} className={`orb orb--${tone}${toggle && !on ? " orb--off" : ""}`}>
       <span className="orb__ring orb__ring--2" aria-hidden="true" />
       <span className="orb__ring orb__ring--1" aria-hidden="true" />
       {toggle ? (
-        <button type="button" className="orb__btn" role="switch" aria-checked={on} aria-label={label} title={on ? "Turn the microphone off (M)" : "Turn the microphone on (M)"} onClick={onToggle}>{inner}</button>
+        <button type="button" className="orb__btn" role="switch" aria-checked={on} aria-label={label} title={on ? "Mute Buddy (M)" : "Unmute Buddy (M)"} onClick={onToggle}>{inner}</button>
       ) : (
         <span className="orb__btn" role="img" aria-label={label}>{inner}</span>
       )}
@@ -78,7 +99,7 @@ function Orb({ tone, icon, levels, toggle, on, onToggle }) {
 }
 
 // ---- Hey Viam -> Command -> Action ----
-function Steps({ st, flow, micOn }) {
+function Steps({ st, flow, micOn, W }) {
   const toggle = micMode(st) === "toggle";
   const { wakeOn, showCmd, act, outcome, cmd } = flow;
   const bad = outcome === "error" || outcome === "notfound";
@@ -88,7 +109,7 @@ function Steps({ st, flow, micOn }) {
     <ol className="steps" aria-label="How a command runs">
       <li className={`step${wakeOn ? " on" : ""}${wakeOn && !cmd ? " active" : ""}`}>
         <span className="step__dot">{wakeOn ? <Check size={14} /> : "1"}</span>
-        <span className="step__lbl">{toggle ? "You spoke" : "Hey Viam"}</span>
+        <span className="step__lbl">{toggle ? "You spoke" : W}</span>
         <span className="step__val">{wakeOn ? (toggle ? "heard you" : "heard") : flow.typed ? "typed" : ""}</span>
       </li>
       <li className={`step${showCmd && cmd.matched ? " on" : ""}${showCmd && !cmd.matched ? " bad" : ""}${!showCmd && wakeOn ? " active" : ""}`}>
@@ -106,24 +127,27 @@ function Steps({ st, flow, micOn }) {
 }
 
 export default function VoicePanel({ st, flow, levels, micOn, onToggleMic }) {
-  const phase = PHASES[st.phase] ? st.phase : "starting";
-  const p = PHASES[phase];
-  const toggle = micMode(st) === "toggle";
+  const W = wakeWord(st);
+  const P = PHASES(W);
+  const phase = P[st.phase] ? st.phase : "starting";
+  const p = P[phase];
+  const toggle = micMode(st) === "toggle", mutable = canMute(st);
   const game = phase === "running" && isGameCommand(st.current || (flow.cmd && flow.cmd.label));
   const tone = game ? "game" : p.tone;
 
   const transcript = flow.cmd && flow.cmd.text && !["muted", "offline", "starting"].includes(phase);
   const title = ["running", "notfound", "done"].includes(st.phase) && st.current ? st.current : micText(st, micOn, phase, "t", p.t);
   const sub = st.phase === "error" ? st.last_error || "" : micText(st, micOn, phase, "s", p.s);
+  const windowS = (st.mic && st.mic.window_s) || 5;
 
   return (
     <section className={`voice${flow.flash ? " voice--flash" : ""}`} aria-label="Voice">
-      <Orb tone={tone} icon={p.icon} levels={levels} toggle={toggle} on={micOn} onToggle={onToggleMic} />
+      <Orb tone={tone} icon={p.icon} levels={levels} toggle={mutable} on={micOn} onToggle={onToggleMic} />
       <div className="voice__text">
         {transcript ? (
           <h1 className="voice__title voice__title--quote">
-            {flow.typed ? "" : <span className="voice__wake">“Hey Viam, </span>}
-            {flow.typed ? `“${flow.cmd.text}”` : `${flow.cmd.text}”`}
+            {flow.typed || toggle ? "" : <span className="voice__wake">“{W}, </span>}
+            {flow.typed || toggle ? `“${flow.cmd.text}”` : `${flow.cmd.text}”`}
           </h1>
         ) : (
           <h1 className="voice__title">{title}</h1>
@@ -134,9 +158,10 @@ export default function VoicePanel({ st, flow, levels, micOn, onToggleMic }) {
           )}
           {transcript && st.phase === "running" ? (st.current ? `On it. ${st.current}.` : sub) : sub}
         </p>
+        <Countdown active={phase === "hearing" && !toggle} seconds={windowS} />
       </div>
       <div className="voice__sep" />
-      <Steps st={st} flow={flow} micOn={micOn} />
+      <Steps st={st} flow={flow} micOn={micOn} W={W} />
       {phase === "running" && (
         <div className="voice__stop">
           <Stop size={16} />

@@ -22,6 +22,15 @@ export function camLabel(cam, arms) {
   return /^table$/i.test(l) ? "Desk" : l;
 }
 
+// The wake word, as the router reports it ("hey buddy"), capitalised for display: "Hey buddy".
+export function wakeWord(st) {
+  const w = (st && st.mic && st.mic.wake_word) || "hey buddy";
+  return w.charAt(0).toUpperCase() + w.slice(1);
+}
+
+// What to say before a command: nothing in tap-to-talk mode, the wake word otherwise.
+export const sayPrefix = (st) => ((st.mic && st.mic.mode) === "toggle" ? "" : `${wakeWord(st)}, `);
+
 // The game the Player runs. The router matches "play shell game" to a set phrase; when the
 // command that's running is the game, the page switches to the game accent.
 export const isGameCommand = (label) => /shell|game/i.test(label || "");

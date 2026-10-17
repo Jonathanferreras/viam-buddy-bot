@@ -83,6 +83,8 @@ h3 { font-size: 20px; font-weight: 700; letter-spacing: -.02em; }
 .voice__wake { color: var(--accent); }
 .voice__sub { font-size: 16px; color: var(--ink2); line-height: 1.35; text-wrap: pretty; min-height: 1.35em; }
 .voice__sep { width: 100%; height: 1px; background: var(--sep); }
+.countdown { width: 160px; height: 4px; margin: 10px auto 0; border-radius: 999px; background: var(--fill); overflow: hidden; }
+.countdown i { display: block; height: 100%; border-radius: 999px; background: var(--blue); transform-origin: left center; transition: transform .1s linear; }
 .voice__stop { width: 100%; display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 14px; background: rgba(255,69,58,.14); font-size: 14px; }
 .voice__stop svg { color: var(--red); flex: none; }
 .mictag { display: inline-flex; align-items: center; gap: 6px; margin-right: 10px; padding: 2px 10px; border-radius: 999px; background: var(--fill); font-size: 13px; font-weight: 600; color: var(--ink); vertical-align: middle; }

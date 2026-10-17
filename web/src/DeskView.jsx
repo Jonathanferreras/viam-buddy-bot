@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { post, depthAt, fmtMM, fmtDist, fmtCm, shortSize, longSize, cap } from "./api.js";
 import { useFrame, useLocal, useTracks } from "./hooks.js";
 import { Mic } from "./icons.jsx";
-import { camLabel, roleFor } from "./roles.js";
+import { camLabel, roleFor, sayPrefix } from "./roles.js";
 
 // ---- one picture (color or depth) with its detection boxes and the hover readout ----
 function View({ kind, src, cam, boxes, probe, probeMM, waitTxt, onPick }) {
@@ -107,7 +107,7 @@ export default function DeskView({ st, busy, bump, onNotice }) {
     setGrabBusy(true); setGrabMsg({ cls: "", text: "Sending the arm…" });
     try {
       const j = await post({ action: "grab_object", id: sel.obj.id, cam: name });
-      setGrabMsg({ cls: "ok", text: `${j.result.started}. Say “Hey Viam, stop” to halt it.` });
+      setGrabMsg({ cls: "ok", text: `${j.result.started}. Say “${prefix}stop” to halt it.` });
     } catch (e) {
       setGrabMsg({ cls: "no", text: "Couldn’t grab it: " + e.message });
     } finally { setGrabBusy(false); }
@@ -127,7 +127,7 @@ export default function DeskView({ st, busy, bump, onNotice }) {
   const say = [...new Set(grabbable)].slice(0, 2).map((l, i) => (i ? `hand me the ${l}` : `grab the ${l}`));
   const game = (st.command_list || []).find((c) => /shell|game/i.test(c.label || "") || (c.phrases || []).some((p) => /shell game/i.test(p)));
   if (game) say.push("let’s play shell game");
-  const prefix = (st.mic && st.mic.mode) === "toggle" ? "" : "Hey Viam, ";
+  const prefix = sayPrefix(st);
 
   const named = tracks.filter((t) => t.named), unnamed = tracks.filter((t) => !t.named);
   const seenN = tracks.filter((t) => t.seen).length;
