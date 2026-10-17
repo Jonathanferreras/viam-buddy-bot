@@ -43,35 +43,42 @@ export function useLocal(key, initial) {
 // ---- one camera picture, fetched a frame at a time (see status_page._live_frame) ----
 // detect=true asks the router for this camera in full (depth + detections); without it a color-only
 // preview is enough, which keeps the network free for the arms.
+// The last picture of each camera stays around after its view unmounts, so switching tabs shows
+// it at once (the router only grabs frames while a page asks, so the first fresh one takes a moment).
+const LAST_FRAME = new Map();   // "cam/kind" -> { url, seq }
 export function useFrame(cam, kind, active, intervalMs = 120, bump = 0, detect = false) {
-  const [src, setSrc] = useState(null);
+  const key = `${cam}/${kind}`;
+  const [src, setSrc] = useState(() => (cam && active && LAST_FRAME.get(key)) ? LAST_FRAME.get(key).url : null);
   useEffect(() => {
     if (!cam || !active) { setSrc(null); return; }
-    let seq = -1, url = null, dead = false;
+    const last = LAST_FRAME.get(key);
+    let seq = last ? last.seq : -1, dead = false, ctrl = null;
+    setSrc(last ? last.url : null);
     const enc = encodeURIComponent(cam);
     (async () => {
       while (!dead) {
         if (document.hidden) { await sleep(500); continue; }
         const t0 = performance.now();
         try {
-          const r = await fetch(`/live/frame?cam=${enc}&kind=${kind}&have=${seq}${detect ? "&detect=1" : ""}`, { cache: "no-store" });
+          ctrl = new AbortController();
+          const r = await fetch(`/live/frame?cam=${enc}&kind=${kind}&have=${seq}${detect ? "&detect=1" : ""}`, { cache: "no-store", signal: ctrl.signal });
           if (r.status === 200 && !dead) {
             seq = +(r.headers.get("X-Seq") || -1);
             const u = URL.createObjectURL(await r.blob());
-            const prev = url;
-            url = u;
+            const prev = LAST_FRAME.get(key);
+            LAST_FRAME.set(key, { url: u, seq });
             setSrc(u);
-            if (prev) setTimeout(() => URL.revokeObjectURL(prev), 1000);
+            if (prev) setTimeout(() => URL.revokeObjectURL(prev.url), 1000);
           }
-        } catch {
+        } catch (e) {
+          if (dead) break;
           await sleep(1500);
         }
         await sleep(Math.max(40, intervalMs - (performance.now() - t0)));
       }
-      if (url) setTimeout(() => URL.revokeObjectURL(url), 1000);
     })();
-    return () => { dead = true; };
-  }, [cam, kind, active, intervalMs, bump, detect]);
+    return () => { dead = true; if (ctrl) ctrl.abort(); };
+  }, [cam, kind, active, intervalMs, bump, detect, key]);
   return src;
 }
 
@@ -129,18 +136,31 @@ export function mode(arr) {
   for (const v of arr) { const c = (n.get(v) || 0) + 1; n.set(v, c); if (c >= bn) { bn = c; best = v; } }
   return best;
 }
-export function useTracks(objects, fps) {
-  const TR = useRef({ list: [], seq: 0 });
+const STORES = new Map();   // camera name -> its tracks, kept while the page is open
+export function useTracks(objects, fps, store) {
+  const own = useRef({ list: [], seq: 0 });
+  let TR = own;
+  if (store) {
+    if (!STORES.has(store)) STORES.set(store, { current: { list: [], seq: 0 } });
+    TR = STORES.get(store);
+  }
   const iv = fps > 0 ? 1000 / fps : 0;
   const staleMs = Math.max(STALE_MS, 1.6 * iv), keepMs = Math.max(KEEP_MS, 3.5 * iv);
   const objs = objects || [];
   const [, force] = useState(0);
   useEffect(() => { const id = setInterval(() => force((n) => n + 1), 250); return () => clearInterval(id); }, []);
+  // a kept store pauses while its view is away: the camera isn't watched then, so nothing was "unseen"
+  useEffect(() => () => { TR.current.pausedAt = Date.now(); }, [TR]);
   const now = Date.now();
   // runs once per /state poll (the objects array is a fresh one each time); a repeat of the same
   // detections still counts as "seen", so a still scene never fades out
   useMemo(() => {
     const tr = TR.current;
+    if (tr.pausedAt) {
+      const shift = now - tr.pausedAt;
+      for (const t of tr.list) { t.lastSeen += shift; t.firstSeen += shift; if (t.estAt) t.estAt += shift; }
+      tr.pausedAt = null;
+    }
     const free = new Set(tr.list);
     const pairs = [];
     for (const o of objs) for (const t of free) {
@@ -211,8 +231,8 @@ export function useKey(key, fn, deps = []) {
 // goes through whichever view can reach it: the arm's own camera first, the desk camera's link second.
 export function useReach(wristCam, deskCam) {
   const live = (c) => (c && c.ok && !c.error ? c.objects : []);
-  const wrist = useTracks(live(wristCam), wristCam ? wristCam.fps : 0);
-  const desk = useTracks(live(deskCam), deskCam ? deskCam.fps : 0);
+  const wrist = useTracks(live(wristCam), wristCam ? wristCam.fps : 0, wristCam && wristCam.name);
+  const desk = useTracks(live(deskCam), deskCam ? deskCam.fps : 0, deskCam && deskCam.name);
   const taken = new Set(), items = [];
   const grabOf = (t, cam) => (t && cam && t.obj.grab && t.obj.grab.arm ? { cam: cam.name, obj: t.obj, info: t.obj.grab } : null);
   const merge = (w, d) => {
