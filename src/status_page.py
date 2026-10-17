@@ -1,7 +1,7 @@
 """
 Tiny local status page for the voice router: http://localhost:8765
 
-Serves one HTML page plus /state (JSON). Runs in a background thread, bound to
+Serves the Buddy Bot page (web/dist, built with Vite; falls back to the inline page below) plus /state (JSON). Runs in a background thread, bound to
 127.0.0.1 only, so nothing outside this computer can reach it. The router hands
 it a function that returns its current state; reconfigures just swap that function.
 """
@@ -16,6 +16,21 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
+
+# ---- the built React page (web/dist): served when it exists, else the inline PAGE below ----
+_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
+_MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+         ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".woff2": "font/woff2", ".json": "application/json",
+         ".map": "application/json"}
+
+
+def _dist_file(rel: str) -> Optional[str]:
+    """Absolute path of a file inside web/dist, or None if it isn't there (or escapes the folder)."""
+    full = os.path.normpath(os.path.join(_DIST, rel))
+    if not full.startswith(_DIST + os.sep) and full != os.path.join(_DIST, "index.html"):
+        return None
+    return full if os.path.isfile(full) else None
+
 
 _state_fn: Optional[Callable[[], Dict[str, Any]]] = None
 _action_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
@@ -222,7 +237,17 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/recordings/"):
             self._recording(urlparse(self.path).path[len("/recordings/"):])
         elif self.path in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8", PAGE)
+            built = _dist_file("index.html")
+            if built:
+                self._send_file(built, "text/html; charset=utf-8")
+            else:
+                self._send(200, "text/html; charset=utf-8", PAGE)
+        elif self.path.startswith("/assets/"):
+            built = _dist_file(urlparse(self.path).path.lstrip("/"))
+            if built:
+                self._send_file(built, _MIME.get(os.path.splitext(built)[1].lower(), "application/octet-stream"), cache=True)
+            else:
+                self._send(404, "text/plain", "not found")
         else:
             self._send(404, "text/plain", "not found")
 
@@ -365,6 +390,17 @@ class _Handler(BaseHTTPRequestHandler):
                     left -= len(chunk)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+
+    def _send_file(self, path: str, ctype: str, cache: bool = False):
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        # Vite names assets by content hash, so they can be cached hard; index.html must not be.
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if cache else "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _send(self, code: int, ctype: str, body: str):
         data = body.encode()
