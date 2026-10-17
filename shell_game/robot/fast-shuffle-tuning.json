@@ -1,0 +1,15 @@
+{
+  "jaw_speed": 500,
+  "open_position": 680,
+  "opening_clearance_verified": false,
+  "execute_cached_trajectories": true,
+  "note": "Estimated 80 mm release from user measurement 100 mm at raw 850, assuming linear mapping and zero gap at raw zero. First physical clearance trial pending. Closing remains torque limited; no fixed 65 mm grip.",
+  "release_extra_mm": null,
+  "position_units_per_mm": 8.5,
+  "requested_release_extra_mm": 20,
+  "stall_seconds": 0.2,
+  "opening_scale_estimated": true,
+  "allow_estimated_opening_trial": true,
+  "full_open_gap_mm_user_measured": 100,
+  "release_gap_mm_target": 80
+}

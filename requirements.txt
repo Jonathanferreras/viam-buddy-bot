@@ -4,3 +4,5 @@ rapidfuzz
 typing-extensions
 numpy
 pillow
+python-dotenv
+opencv-python-headless

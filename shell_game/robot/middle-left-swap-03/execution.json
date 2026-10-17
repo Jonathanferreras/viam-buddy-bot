@@ -1,0 +1,188 @@
+{
+  "completed": false,
+  "cup_transfers_completed": 2,
+  "events": [
+    {
+      "event": "execution_started"
+    },
+    {
+      "event": "move_requested",
+      "transfer": 1,
+      "phase": "approach",
+      "target": {
+        "x": 355.1794374836205,
+        "y": -528.7393054204983,
+        "z": 230.0,
+        "o_x": 0.010019660421921324,
+        "o_y": 0.054719257483093926,
+        "o_z": -0.9984515057154904,
+        "theta": -9.249524670091432
+      }
+    },
+    {
+      "event": "move_completed",
+      "transfer": 1,
+      "phase": "approach",
+      "actual": {
+        "x": 355.1694144208345,
+        "y": -528.7502862666997,
+        "z": 230.00037502032956,
+        "o_x": 0.010019461905563142,
+        "o_y": 0.054718305430942235,
+        "o_z": -0.9984515598835484,
+        "theta": -9.249534611055747
+      }
+    },
+    {
+      "event": "move_requested",
+      "transfer": 1,
+      "phase": "descend",
+      "target": {
+        "x": 355.1794374836205,
+        "y": -528.7393054204983,
+        "z": 100.0,
+        "o_x": 0.010019660421921324,
+        "o_y": 0.054719257483093926,
+        "o_z": -0.9984515057154904,
+        "theta": -9.249524670091432
+      }
+    },
+    {
+      "event": "move_completed",
+      "transfer": 1,
+      "phase": "descend",
+      "actual": {
+        "x": 355.1795042140301,
+        "y": -528.7391707110796,
+        "z": 100.01279699241897,
+        "o_x": 0.010019185629962471,
+        "o_y": 0.05471971191483439,
+        "o_z": -0.9984514855751736,
+        "theta": -9.249020662374763
+      }
+    },
+    {
+      "event": "jaw_command",
+      "opening": false
+    },
+    {
+      "event": "hold_confirmed",
+      "position": {
+        "pos": 495.0
+      },
+      "meta": {
+        "position": 494.0,
+        "status": 2.0
+      }
+    },
+    {
+      "event": "move_requested",
+      "transfer": 1,
+      "phase": "slide",
+      "target": {
+        "x": 180.13320095249014,
+        "y": -513.5023701964498,
+        "z": 100.0,
+        "o_x": 0.010019660421921324,
+        "o_y": 0.054719257483093926,
+        "o_z": -0.9984515057154904,
+        "theta": -9.249524670091432
+      }
+    },
+    {
+      "event": "move_completed",
+      "transfer": 1,
+      "phase": "slide",
+      "actual": {
+        "x": 180.14555569341073,
+        "y": -513.5034607077741,
+        "z": 99.99941155946493,
+        "o_x": 0.01002035776357365,
+        "o_y": 0.05472052691501193,
+        "o_z": -0.9984514291463725,
+        "theta": -9.249780847863914
+      }
+    },
+    {
+      "event": "jaw_command",
+      "opening": true
+    },
+    {
+      "event": "release_confirmed",
+      "position": {
+        "pos": 850.0
+      }
+    },
+    {
+      "event": "transfer_released",
+      "cup": "A",
+      "source": "left",
+      "destination": "middle"
+    },
+    {
+      "event": "move_requested",
+      "transfer": 1,
+      "phase": "retreat",
+      "target": {
+        "x": 180.13320095249014,
+        "y": -513.5023701964498,
+        "z": 230.0,
+        "o_x": 0.010019660421921324,
+        "o_y": 0.054719257483093926,
+        "o_z": -0.9984515057154904,
+        "theta": -9.249524670091432
+      }
+    },
+    {
+      "event": "move_completed",
+      "transfer": 1,
+      "phase": "retreat",
+      "actual": {
+        "x": 180.1332621960035,
+        "y": -513.5024251047988,
+        "z": 229.98943257431827,
+        "o_x": 0.010019398961673438,
+        "o_y": 0.05471966082665365,
+        "o_z": -0.9984514862342903,
+        "theta": -9.249188412138787
+      }
+    },
+    {
+      "event": "released_cup_observed",
+      "slot": "middle",
+      "nearest_fit": {
+        "center_world_mm": [
+          161.93992189470316,
+          -519.7712877175992,
+          91.6419753382462
+        ],
+        "radius_mm": 27.069845677959307,
+        "boundary_rms_mm": 0.7448401282543732,
+        "plane_rms_mm": 0.7415886346212928,
+        "points": 11600
+      },
+      "distance_from_planned_xy_mm": 19.243043671973638
+    }
+  ],
+  "occupied": {
+    "proposed_parking": "B",
+    "right": "C",
+    "middle": "A"
+  },
+  "contact_alignment_validated": false,
+  "grip_torque_percent": 10,
+  "grip_position_target": 450,
+  "error": "Released cup position not reliably verified; stop before next cup",
+  "stop_sent": true,
+  "arm_is_moving": false,
+  "holding_at_stop": false,
+  "final_gripper_world": {
+    "x": 180.1332621960035,
+    "y": -513.5024251047988,
+    "z": 229.98943257431827,
+    "o_x": 0.010019398961673438,
+    "o_y": 0.05471966082665365,
+    "o_z": -0.9984514862342903,
+    "theta": -9.249188412138787
+  }
+}

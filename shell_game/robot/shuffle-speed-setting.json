@@ -1,0 +1,8 @@
+{
+  "speed_degrees_per_second": 180,
+  "acceleration_degrees_per_second_squared": 300,
+  "motion_requested": false,
+  "applied": true,
+  "response": {},
+  "arm_is_moving": false
+}

@@ -194,8 +194,11 @@ class Calibration:
 
     MIN_POINTS = 4
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, planar_ok: bool = False):
         self.path = path
+        # planar_ok: the points may all lie at one height (things standing on a table, as the
+        # table-camera link records them); 3+ spread-out points in a plane still fix the transform.
+        self.planar_ok = planar_ok
         self.points: List[Dict[str, Any]] = []
         self.R: Optional[np.ndarray] = None
         self.t: Optional[np.ndarray] = None
@@ -247,8 +250,9 @@ class Calibration:
         Q = np.array([[p["arm"]["x"], p["arm"]["y"], p["arm"]["z"]] for p in self.points])
         # need the points spread out in 3D, or the rotation is a guess
         sv = np.linalg.svd(P - P.mean(axis=0), compute_uv=False)
-        if sv[1] < 40 or sv[2] < 15:
-            self.warning = ("points are too close together or all at one height; "
+        if sv[1] < 40 or (sv[2] < 15 and not self.planar_ok):
+            self.warning = ("points are too close together" if self.planar_ok else
+                            "points are too close together or all at one height; "
                             "record some farther apart and at different heights")
             return
         R, t = kabsch(P, Q)
@@ -258,7 +262,8 @@ class Calibration:
         self.rms_mm = round(float(math.sqrt((err ** 2).mean())), 1)
         if self.rms_mm > 15:
             self.warning = (f"average error is {self.rms_mm} mm — too high to grab reliably; "
-                            "undo the worst points or re-record")
+                            + ("it relearns as things are moved around" if self.planar_ok else
+                               "undo the worst points or re-record"))
 
     @property
     def ready(self) -> bool:
@@ -547,7 +552,18 @@ def detect_objects(color_img: Optional[Image.Image], depth_mm: np.ndarray, intr:
             continue                                                  # not sitting on the mat or table
         hb0 = H[r0, c0][valid[r0, c0]]
         if hb0.size >= 5 and (float(np.percentile(hb0, 10)) > 60 or float(np.median(hb0)) > 90):
-            continue                                                  # floating above the table: part of an arm
+            # Everything well above the table: usually part of an arm reaching in. But a can or bottle
+            # standing up, seen from straight above (a wrist camera), looks exactly like this too: only
+            # its top face shows, all at one height, and its sides are hidden. Keep it when it's compact
+            # enough to be a thing on the table (an arm is bigger, taller, or runs out of the picture).
+            zmed = float(np.median(d[r0, c0][valid[r0, c0]]))
+            span_px = max(c0.max() - c0.min(), r0.max() - r0.min()) + 1
+            span_mm = span_px * step * zmed / fx
+            at_edge = r0.min() == 0 or c0.min() == 0 or r0.max() >= hh - 1 or c0.max() >= ww - 1
+            standing = (not at_edge and span_mm <= 140 and float(np.percentile(hb0, 90)) <= 200
+                        and hb0.size >= 12)
+            if not standing:
+                continue                                              # floating above the table: part of an arm
         parts.extend(_split_stacked(blob0, H, valid, min_px))
     e1 = np.cross(n, [1.0, 0.0, 0.0]); e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1)   # axes in the table plane
     for blob, rest in parts:                                          # rest: height of what it lies on (0 = table)
@@ -625,6 +641,18 @@ def detect_objects(color_img: Optional[Image.Image], depth_mm: np.ndarray, intr:
                     axis = major[0] * e1 + major[1] * e2
         px = rgb[rows, cols]
         color_name = _name_color(px)
+        if tall and color_name in ("white", "gray", "black"):
+            # A can standing up, seen from above, shows its silver lid and only a thin ring of its painted
+            # side: the color it's known by is that ring's. Look over its box (minus the mat) for a strong
+            # color; a plain white cup has none, a red can's rim is ~20% red.
+            r0, r1, c0_, c1 = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+            bh, bs, bv = hue[r0:r1, c0_:c1], sat[r0:r1, c0_:c1], val[r0:r1, c0_:c1]
+            off_mat = ~mat[r0:r1, c0_:c1]
+            strong = (bs > 0.45) & (bv > 0.2) & off_mat
+            if off_mat.sum() > 0 and strong.sum() / off_mat.sum() >= 0.10:
+                accent = _name_color(rgb[r0:r1, c0_:c1][strong])
+                if accent not in ("white", "gray", "black", "blue"):   # (blue: the mat's edge)
+                    color_name = accent
         block = None
         hv = hsv[rows, cols]
         for cname, spec in colors.items():

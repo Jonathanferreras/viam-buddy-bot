@@ -14,3 +14,16 @@ web/node_modules/
 web/dist/
 
 .DS_Store
+
+# jenga: the tower spot and progress (runtime)
+jenga/tower.json
+
+# secrets and local scratch
+.env
+*.tgz
+.main.py.before-putback
+.patch_*.py
+
+# shell game: captures and per-run plan caches (large, runtime)
+shell_game/robot/runs/
+shell_game/robot/stereo-scan/

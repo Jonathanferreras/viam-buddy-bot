@@ -1,0 +1,9 @@
+# from upstream viam-shell-game: credentials and per-run data stay local
+.env
+robot/.env
+robot/runs/
+robot/stereo-scan/
+robot/.run.lock
+*.pcd
+*.jpg
+*.png

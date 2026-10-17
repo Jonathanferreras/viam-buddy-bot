@@ -59,7 +59,20 @@ Config attributes:
   ]
 }
 
-Each command uses either "command" (DoCommand payload) or "action" (built-in: "wave").
+Each command uses either "command" (DoCommand payload) or "action" (built-in: "wave", ...).
+
+Shell game (arm 18; the code in shell_game/, from github.com/dramirez4/viam-shell-game):
+    {"action": "shell_game", "resource": "arm", "name": "arm 18",
+     "phrases": ["let's play", "play shell game"],
+     "swaps": 3,                 # 2-6 pair swaps
+     "ball_timeout_s": 180}      # how long to hold the cup up waiting for the red ball
+    {"action": "shell_game_guess", "phrases": ["left cup", "middle cup", "right cup", ...]}   # or tap a cup
+    {"action": "shell_game_reveal", "phrases": ["where is the ball", "show me the ball"]}
+"Let's play": arm 18 scans the cups, lifts the middle one and waits for the red ball to be set down
+and settle, covers it and shuffles. Then the player taps the cup they think hides the ball on the
+status page (Player tab) or says "left cup", and arm 18 lifts that cup. Runs shell_game/play.py as a
+child process against arm 18's own machine (credentials in shell_game/robot/.env). "stop" interrupts
+it and halts the arm. The game's stage is in the status page state as "game".
 
 DoCommand (for testing without speaking):
   {"simulate": "play shell game"}  -> routes the text as if it were heard
@@ -72,6 +85,8 @@ import json
 import math
 import os
 import re
+import signal
+import sys
 import time
 from collections import deque
 from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -92,6 +107,8 @@ from viam.utils import ValueTypes, struct_to_dict
 from viam.proto.common import Pose
 
 from . import identify, kin, recorder, sounds, status_page, vision
+from . import features   # plug-in features (src/features/*.py): new ones need no edits here
+from . import grip       # gentle gripper close (the shell game's cup grip)
 
 LOGGER = getLogger(__name__)
 SAMPLE_RATE = 16000
@@ -107,6 +124,19 @@ _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POSES_FILE = os.path.join(_HERE, "wave_poses.json")
 CALIB_FILE = os.path.join(_HERE, "camera_calibration.json")
 MODEL_DIR = os.path.join(_HERE, "models", "clip")
+SHELL_DIR = os.path.join(_HERE, "shell_game")   # the shell game (github.com/dramirez4/viam-shell-game)
+_SHELL_ACTIONS = ("shell_game", "shell_game_guess", "shell_game_reveal", "shell_game_putdown")
+_SHELL_SLOTS = {"left": "left", "middle": "middle", "center": "middle", "centre": "middle", "right": "right"}
+
+
+def _slot_in(text: str) -> Optional[str]:
+    """'is it on the left' -> 'left'; None when no cup position is mentioned."""
+    for w in re.sub(r"[^a-z ]", " ", text.lower()).split():
+        if w in _SHELL_SLOTS:
+            return _SHELL_SLOTS[w]
+    return None
+
+
 _IDENTIFIER: Optional["identify.Identifier"] = None   # one object-naming model per process
 
 
@@ -159,8 +189,11 @@ def _cap(s: str) -> str:
 # The first intent whose words appear wins, so "stop" beats everything and "put it down" isn't a grab.
 _INTENTS = [
     ("stop", ["stop", "halt", "freeze", "abort", "cancel"]),
-    ("release", ["let go", "letting go", "release", "drop", "open the gripper", "open gripper", "open your hand",
-                 "put it down", "put down", "set it down"]),
+    # "put it back (down)": take what it's holding back to where it picked it up and set it down there
+    ("put_back", ["put it back", "put that back", "put back", "place it back", "back down", "put it down",
+                  "put that down", "put down", "set it down", "set that down", "set down", "place it",
+                  "return it", "put the"]),
+    ("release", ["let go", "letting go", "release", "drop", "open the gripper", "open gripper", "open your hand"]),
     ("home", ["reset", "go home", "go back", "back to the start", "back to start", "starting position",
               "start position", "return"]),
     ("wave", ["wave", "say hi", "say hello"]),
@@ -187,7 +220,8 @@ _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixt
 _NLU_WORDS = sorted({w for _, ws in _INTENTS for p in ws for w in p.split()} | set(_COLORS) | set(_NOUNS)
                     | set(_ORDINALS) | {"two", "three", "four", "five", "six", "number"}
                     | {"the", "a", "an", "arm", "please", "can", "you", "me", "up", "it", "that", "this", "to",
-                       "your", "and", "now", "go", "thing", "one", "seventeen", "eighteen", "hey", "buddy"})
+                       "your", "and", "now", "go", "thing", "one", "seventeen", "eighteen", "hey", "buddy"}
+                    | {"left", "middle", "right", "center", "where", "is", "in", "on", "under", "with"})
 
 
 def _number_duplicates(objs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -373,6 +407,8 @@ class VoiceRouter(Generic, EasyResource):
                 if c.get("action") == "grab" and not c.get("color"):
                     raise ValueError(f"commands[{i}] (grab) needs 'color'")
                 targets = []
+            elif c.get("action") in ("shell_game_guess", "shell_game_reveal"):
+                targets = []
             elif c.get("action") == "stop":
                 targets = c.get("resources") or []
                 if not targets:
@@ -454,7 +490,15 @@ class VoiceRouter(Generic, EasyResource):
                 "name": c.get("name") or c.get("resource") or "",   # friendly name, e.g. "arm 18"
                 "wave_pose": c.get("wave_pose"),  # optional joint list; overrides a taught pose
                 "color": (c.get("color") or "").lower() or None,    # grab: which block
+                # shell game: how many swaps, and how long to wait for the ball
+                "swaps": max(2, min(6, int(c.get("swaps", 3)))),
+                "ball_timeout_s": max(20.0, float(c.get("ball_timeout_s", 180))),
             })
+        self._shell_proc: Optional[asyncio.subprocess.Process] = None
+        shell = next((c for c in self.commands if c["action"] == "shell_game"), None)
+        self._shell_arm: Optional[str] = shell["resource_name"] if shell else None
+        if getattr(type(self), "_GAME", None) is None:     # the game survives a reconfigure
+            self._game_reset()
 
         # ---- vision / grabbing (optional) ----
         vis = attrs.get("vision") or {}
@@ -502,6 +546,12 @@ class VoiceRouter(Generic, EasyResource):
                     "arm": _find_dep(dependencies, a["arm"]),
                     "gripper_name": a["gripper"], "gripper": _find_dep(dependencies, a["gripper"]),
                     "calibration": vision.Calibration(path), "holding": None,
+                    # The table camera linked to this arm, learned by itself: whenever the table camera and
+                    # this arm's wrist camera see the same thing at the same time, that's one more point
+                    # pairing where the table camera sees it with where it is in the arm's base frame.
+                    # Once solved, the table camera can hand this arm things its wrist camera can't see.
+                    "table_link": vision.Calibration(os.path.join(_HERE, f"table_link.{slug}.json"), planar_ok=True),
+                    "_link_t": 0.0,
                     # how hard the gripper squeezes, 1-100 % (UFactory G2 gripper; None = its own setting)
                     "grip_force": max(1, min(100, int(a["grip_force_pct"]))) if a.get("grip_force_pct") else None,
                     # joint acceleration while picking something up (deg/s^2, xArm max 1145), then back to normal
@@ -538,6 +588,7 @@ class VoiceRouter(Generic, EasyResource):
         status_page.set_state_source(self._snapshot)
         status_page.set_action_handler(self._handle_page_action)
         status_page.start(int(attrs.get("status_port", 8765)), LOGGER)
+        features.configure(self, attrs)
 
         # viam-server may rebuild this resource on a config change without closing the old
         # instance first; make sure only one listener ever runs so a command can't fire twice.
@@ -715,13 +766,20 @@ class VoiceRouter(Generic, EasyResource):
         return dict(sorted(arms.items(), key=lambda kv: kv[1]["name"]))
 
     def _arms_for(self, cmd: Dict[str, Any]) -> List[str]:
+        if features.owns(cmd["action"]):
+            return features.arms_for(self, cmd)
         if cmd["action"] == "wave":
             return [cmd["resource_name"]]
         if cmd["action"] == "release":
             held = [k for k, g in self.grabbers.items() if g["holding"]]
             return held or list(self.grabbers)[:1]
-        if cmd["action"] in ("pick", "home", "find_grab"):
+        if cmd["action"] in ("pick", "home", "find_grab", "shell_game", "put_back"):
             return [cmd["resource_name"]]
+        if cmd["action"] == "shell_game_putdown" or (cmd["action"] in ("shell_game_guess", "shell_game_reveal")
+                                                     and self._game["stage"] == "guess"):
+            return [self._shell_arm] if self._shell_arm else []
+        if cmd["action"] in ("shell_game_guess", "shell_game_reveal"):
+            return []   # no game to guess: nothing moves
         if cmd["action"] == "grab" and self.picker:
             return [self.picker]
         return []   # grab: the arm is chosen once the camera has looked (see _pick)
@@ -879,6 +937,8 @@ class VoiceRouter(Generic, EasyResource):
                                                     naming=namer.status(), preview=False)
                         self._det_n[name] = self._det_n.get(name, 0) + 1
                         self._det_at[name] = time.time()
+                        if arm is not None:   # a wrist camera: pair what it sees with the table camera's view
+                            self._learn_link(c, objs, pose)
                     except Exception as e:
                         status_page.set_live_status(name, objects=[], detect_error=str(e) or type(e).__name__)
                 elif intr_err:
@@ -998,6 +1058,8 @@ class VoiceRouter(Generic, EasyResource):
             "command_list": [{"label": self._label(c), "phrases": c["phrases"]} for c in self.commands],
             "history": list(reversed(self._history)),
             "events": dict(self._events),
+            "game": self._game_view(),
+            "features": features.state(self),
             "sound_level_feed": status_page._level_ok,
             "sound_level": round(status_page._level, 3),
             "wave_arms": [
@@ -1014,6 +1076,7 @@ class VoiceRouter(Generic, EasyResource):
             "vision": None if not self.vision else {
                 "colors": [c["color"] for c in self.commands if c["action"] == "grab"] or list(self.vision["colors"]),
                 "arms": [{"key": g["key"], "name": g["name"], "calibration": g["calibration"].summary(),
+                          "table_link": g["table_link"].summary(),
                           "handoff_saved_at": (self._poses.get(self._handoff_key(g)) or {}).get("saved_at"),
                           "holding": g["holding"]} for g in self.grabbers.values()],
                 "last_look": self._last_look,
@@ -1090,6 +1153,12 @@ class VoiceRouter(Generic, EasyResource):
             async def clear():
                 return self._clear_wave_pose(arm)
             return asyncio.run_coroutine_threadsafe(clear(), self._loop).result(timeout=5)
+        if action in ("shell_start", "shell_guess", "shell_clear", "shell_putdown"):
+            fut = asyncio.run_coroutine_threadsafe(self._game_from_page(action, str(body.get("slot") or "")), self._loop)
+            return fut.result(timeout=10)
+        fa = features.page_action(self, action, body)
+        if fa is not None:
+            return asyncio.run_coroutine_threadsafe(fa, self._loop).result(timeout=30)
         vision_actions = {
             "look": lambda: self._look(str(body.get("color") or "") or None, record=True),
             "calib_record": lambda: self._calib_record(str(body.get("color") or "green"), arm),
@@ -1110,6 +1179,8 @@ class VoiceRouter(Generic, EasyResource):
     def _label(cmd: Dict[str, Any]) -> str:
         if cmd["label"]:
             return cmd["label"]
+        if features.owns(cmd["action"]):
+            return features.label(cmd)
         if cmd["action"] == "grab":
             return f"Grabbing the {cmd['color']} block"
         if cmd["action"] == "release":
@@ -1118,6 +1189,14 @@ class VoiceRouter(Generic, EasyResource):
             return f"Waving {cmd['resource_name']}"
         if cmd["action"] == "stop":
             return "Stop"
+        if cmd["action"] == "shell_game":
+            return "Playing the shell game"
+        if cmd["action"] == "shell_game_guess":
+            return "Guessing the cup"
+        if cmd["action"] == "shell_game_reveal":
+            return "Where's the ball?"
+        if cmd["action"] == "shell_game_putdown":
+            return "Putting the cup down"
         return f"Running {cmd['resource_name']}"
 
     # ---------- speech -> text ----------
@@ -1138,7 +1217,7 @@ class VoiceRouter(Generic, EasyResource):
             if self.use_grammar or only:
                 vocab = sorted({p for c in cmds for p in c["phrases"]})
                 if only is None:     # words for free-form commands ("pick up the red ball"), usable in any order
-                    vocab.append(" ".join(_NLU_WORDS))
+                    vocab.append(" ".join(sorted(set(_NLU_WORDS) | features.words())))
                     vocab.append(self.wake_word)   # "hey buddy", so the wake word can be recognised at all
                 return KaldiRecognizer(model, SAMPLE_RATE, json.dumps(vocab + ["[unk]"]))
             return KaldiRecognizer(model, SAMPLE_RATE)
@@ -1397,6 +1476,10 @@ class VoiceRouter(Generic, EasyResource):
         words = [_NUMBERS.get(w, w) for w in re.sub(r"[^a-z0-9 ]", " ", text.lower()).split()]
         t = " " + " ".join(words) + " "
         intent = next((name for name, ws in _INTENTS if any(f" {w} " in t for w in ws)), None)
+        if intent != "stop":   # plug-in features get first say on everything but "stop"
+            fcmd = features.understand(self, words, text)
+            if fcmd is not None:
+                return fcmd
         if intent is None:
             return None
         nums = [w for w in words if w.isdigit()]
@@ -1406,6 +1489,17 @@ class VoiceRouter(Generic, EasyResource):
         if intent == "release":
             return next((c for c in self.commands if c["action"] == "release"), None) or self._mk_cmd(
                 action="release", resource_name=self.picker or ", ".join(self.grabbers), label="Letting go")
+        if intent == "put_back":
+            gs = getattr(self, "grabbers", {})
+            held = [g for g in gs.values() if g["holding"]]
+            g = (gs.get(arm) if arm in gs else None) or (held[0] if held else None) or \
+                (gs.get(self.picker) if self.picker else None) or next(iter(gs.values()), None)
+            if g is None:
+                return None
+            what = g["holding"] if g["holding"] and g["holding"] != "something" else \
+                ((self._picked_from(g) or {}).get("what") if g["holding"] else None)
+            return self._mk_cmd(action="put_back", resource_name=g["key"], resource=g["arm"], name=g["name"],
+                                label=f"Putting the {what} back" if what else "Putting it back down")
         if intent in ("home", "wave"):
             rn = arm or self.picker or next(iter(getattr(self, "_arms", {})), None)
             if rn is None:
@@ -1475,7 +1569,10 @@ class VoiceRouter(Generic, EasyResource):
             self._record(heard=text, matched=True, skipped=True, label=label)
             return {"heard": text, "matched": True, "skipped": "previous command still running"}
 
-        # Run in the background so the listener stays free to hear "stop".
+        return self._launch(cmd, text, label, typed)
+
+    def _launch(self, cmd: Dict[str, Any], text: str, label: str, typed: bool) -> Dict[str, Any]:
+        """Start a command in the background, so the listener stays free to hear "stop"."""
         self._stage = None
         self._set_phase("running", current=label)
         self._action_arms = self._arms_for(cmd)
@@ -1485,14 +1582,22 @@ class VoiceRouter(Generic, EasyResource):
         return {"heard": text, "matched": True, "resource": cmd["resource_name"], "started": label}
 
     async def _run(self, cmd: Dict[str, Any], text: str, label: str) -> None:
+        good = True   # False: finished, but with a "no" (a wrong shell-game guess) -> the "off" chime
         try:
             async with self._busy:
-                if cmd["action"] == "wave":
+                if features.owns(cmd["action"]):
+                    await features.run(self, cmd, text)
+                elif cmd["action"] in _SHELL_ACTIONS:
+                    label, good = await getattr(self, "_" + cmd["action"])(cmd, text)
+                    self._current = label
+                elif cmd["action"] == "wave":
                     await self._wave(cmd)
                 elif cmd["action"] == "grab":
                     await self._grab(cmd)
                 elif cmd["action"] == "release":
                     await self._release(cmd.get("only"))
+                elif cmd["action"] == "put_back":
+                    await self._put_back(cmd)
                 elif cmd["action"] == "home":
                     await self._go_home(cmd)
                 elif cmd["action"] == "find_grab":
@@ -1508,9 +1613,11 @@ class VoiceRouter(Generic, EasyResource):
                 self._rec_moved()
             if self._stage:
                 self._stage = "done"
-            self._set_phase("done", hold_s=3,
-                            current=self._current if cmd["action"] in ("grab", "release", "pick", "find_grab") else None)
-            self._play("done")
+            shell = cmd["action"] in _SHELL_ACTIONS
+            self._set_phase("done", hold_s=12 if shell else 3,
+                            current=self._current if shell or cmd.get("keep_current") or cmd["action"] in ("grab", "release", "pick", "find_grab", "put_back")
+                            else None)
+            self._play("done" if good else "wake_off")
         except asyncio.CancelledError:
             pass  # stopped on purpose; _stop records it
         except NotFound as e:
@@ -1556,6 +1663,206 @@ class VoiceRouter(Generic, EasyResource):
         return {"heard": text, "matched": True, "stopped": cmd["resource_name"],
                 "interrupted": interrupted, "errors": errors}
 
+    # ---------- shell game (arm 18) ----------
+    # "Let's play" runs shell_game/play.py start: arm 18 scans the cups, lifts the middle one, waits for
+    # the red ball to be set down and settle, covers it and shuffles. The player then taps a cup on the
+    # status page (or says "left cup") and play.py reveal lifts that cup. play.py prints
+    # "STAGE <id> <text>" lines; self._game holds where the game is for the status page. The answer is
+    # kept here and only sent to the page once the cup is up.
+    GAME_STAGES = ("ready", "scan", "lift", "ball", "cover", "shuffle", "guess", "reveal", "result")
+
+    def _game_reset(self, **kw) -> None:
+        type(self)._GAME = {"stage": None, "detail": "", "run": None, "answer": None, "guess": None,
+                            "result": None, "error": None, "notice": None, "since": time.time(), **kw}
+
+    @property
+    def _game(self) -> Dict[str, Any]:
+        return type(self)._GAME
+
+    def _game_view(self) -> Dict[str, Any]:
+        g = self._game
+        shell = next((c for c in self.commands if c["action"] == "shell_game"), None)
+        games = []
+        if shell:
+            games.append({"id": "shell", "name": "Shell game", "arm": shell["name"], "say": shell["phrases"][0],
+                          "blurb": "Put the red ball under the middle cup, watch the shuffle, then tap the cup you think hides it.",
+                          "swaps": shell["swaps"]})
+        shown = g["stage"] == "result"
+        return {"games": games, "stages": list(self.GAME_STAGES), "running": self._shell_proc is not None,
+                "stage": g["stage"], "detail": g["detail"], "guess": g["guess"], "error": g["error"],
+                "result": g["result"] if shown else None, "answer": g["answer"] if shown else None,
+                "notice": g["notice"], "since": g["since"], "camera": "cam",
+                "cups_view": g.get("cups_view") if g["stage"] in ("guess", "reveal", "result") else None}
+
+    def _game_result_text(self) -> str:
+        g = self._game
+        if g["result"] == "win":
+            return f"You found it! The ball was under the {g['guess']} cup"
+        if g["result"] == "lose":
+            return f"Not that one. The ball is under the {g['answer']} cup"
+        return f"The ball is under the {g['answer']} cup"
+
+    def _game_stage(self, sid: str, text: str) -> None:
+        g = self._game
+        if sid == "lifted":                  # the picked cup is up: now the page may know
+            g.update(stage="result", detail=self._game_result_text())
+        elif sid == "putback":
+            pass
+        else:
+            g.update(stage=sid, detail=text, error=None)
+        if self._phase == "running":
+            self._current = g["detail"]
+
+    async def _game_proc(self, *args: str) -> Tuple[int, Optional[str], Optional[str]]:
+        """Run play.py with these arguments, following its stages. Returns (exit code, run folder, why it stopped)."""
+        script = os.path.join(SHELL_DIR, "play.py")
+        if not os.path.exists(script):
+            raise RuntimeError(f"the shell game isn't installed ({script} is missing)")
+        if not os.path.exists(os.path.join(SHELL_DIR, "robot", ".env")):
+            raise RuntimeError("the shell game needs arm 18's address and API key in shell_game/robot/.env")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", script, *args, cwd=SHELL_DIR, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT, start_new_session=True)  # own process group: "stop" reaches its scripts too
+        self._shell_proc = proc
+        out: deque = deque(maxlen=30)
+        run_dir = None
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                s = line.decode(errors="replace").rstrip()
+                if not s:
+                    continue
+                out.append(s)
+                if s.startswith("STAGE "):
+                    parts = s.split(" ", 2)
+                    self._game_stage(parts[1], parts[2] if len(parts) > 2 else "")
+                    LOGGER.info(f"shell game: {self._game['detail']}")
+                elif s.startswith("Run log:"):
+                    run_dir = s.split(":", 1)[1].strip()
+                else:
+                    LOGGER.debug(f"shell game: {s}")
+            rc = await proc.wait()
+        except asyncio.CancelledError:
+            await self._shell_kill()
+            self._game.update(stage="stopped", detail="Stopped. If arm 18 is holding a cup, set it down before playing again.")
+            raise
+        finally:
+            self._shell_proc = None
+        why = None
+        if rc != 0:
+            why = next((l[len("Stopped:"):].strip() for l in reversed(out) if l.startswith("Stopped:")), None) \
+                or (out[-1] if out else f"exit code {rc}")
+            if "Stationary empty arm required" in why or "empty gripper" in why:
+                why = "Arm 18 is still holding a cup. Tap “Put the cup down” first."
+        return rc, run_dir, why
+
+    async def _shell_game(self, cmd: Dict[str, Any], text: str) -> Tuple[str, bool]:
+        self._game_reset(stage="ready", detail="Getting ready")
+        LOGGER.info(f"shell game: starting ({cmd['swaps']} swaps)")
+        rc, run_dir, why = await self._game_proc("start", "--swaps", str(cmd["swaps"]),
+                                                 "--ball-timeout", str(cmd["ball_timeout_s"]))
+        report: Dict[str, Any] = {}
+        if run_dir:
+            with contextlib.suppress(Exception):
+                with open(os.path.join(run_dir, "execution.json")) as f:
+                    report = json.load(f)
+        if rc != 0 or not report.get("private_ball_final_slot"):
+            why = why or "the shuffle didn't finish"
+            self._game.update(stage="error", error=why, detail=why)
+            raise RuntimeError(f"shell game stopped: {why}")
+        cups_view = None    # where each cup is in arm 18's camera picture, for tap targets on the live view
+        with contextlib.suppress(Exception):
+            with open(os.path.join(run_dir, "guess_view.json")) as f:
+                cups_view = json.load(f)
+        self._game.update(run=run_dir, answer=report["private_ball_final_slot"], stage="guess",
+                          detail="Tap the cup you think hides the ball", cups_view=cups_view)
+        return "Shuffled! Tap the cup you think hides the ball", True
+
+    async def _game_lift(self, slot: str, result: str) -> Tuple[str, bool]:
+        g = self._game
+        g.update(guess=slot, result=result, stage="reveal", detail=f"Lifting the {slot} cup")
+        LOGGER.info(f"shell game: lifting the {slot} cup")
+        rc, _, why = await self._game_proc("reveal", "--run", g["run"], "--slot", slot)
+        if rc != 0:
+            g.update(stage="error", error=why, detail=why)
+            raise RuntimeError(f"shell game stopped: {why}")
+        g.update(stage="result", detail=self._game_result_text())
+        return g["detail"], result != "lose"
+
+    async def _shell_game_guess(self, cmd: Dict[str, Any], text: str) -> Tuple[str, bool]:
+        g = self._game
+        if g["stage"] != "guess" or not g["answer"]:
+            raise NotFound("There's no shuffled game to guess yet. Say \"let's play\"")
+        slot = _slot_in(text)
+        if not slot:
+            raise NotFound("Pick the left, middle or right cup")
+        return await self._game_lift(slot, "win" if slot == g["answer"] else "lose")
+
+    async def _shell_game_reveal(self, cmd: Dict[str, Any], text: str) -> Tuple[str, bool]:
+        g = self._game
+        if g["stage"] != "guess" or not g["answer"]:
+            raise NotFound("There's no shuffled game right now. Say \"let's play\"")
+        return await self._game_lift(g["answer"], "shown")
+
+    async def _shell_game_putdown(self, cmd: Dict[str, Any], text: str) -> Tuple[str, bool]:
+        """After a stop: set down a cup arm 18 is still holding, and go back to the start."""
+        self._game_reset(stage="putdown", detail="Putting the cup down")
+        rc, _, why = await self._game_proc("putdown")
+        if rc != 0:
+            self._game.update(stage="error", error=why, detail=why)
+            raise RuntimeError(f"couldn't put the cup down: {why}")
+        self._game_reset(notice="Line the three cups up again before the next game.")
+        return "Cup is down. Line the cups up, then play again", True
+
+    async def _game_from_page(self, action: str, slot: str) -> Dict[str, Any]:
+        """The Player tab: Play, tap a cup, or put the finished game away."""
+        busy = self._action_task is not None and not self._action_task.done()
+        if action == "shell_clear":
+            if busy and self._shell_proc is not None:
+                raise ValueError("the game is still running")
+            self._game_reset()
+            return {"cleared": True}
+        if busy:
+            raise ValueError("an arm is busy; wait for it to finish (or say “Hey buddy, stop”)")
+        if action == "shell_putdown":
+            cmd = self._mk_cmd(action="shell_game_putdown", label="Putting the cup down",
+                               resource_name=self._shell_arm or "", name="arm 18")
+            text = "Tapped Put the cup down"
+        elif action == "shell_start":
+            cmd = next((c for c in self.commands if c["action"] == "shell_game"), None)
+            if cmd is None:
+                raise ValueError("there's no shell game in the router's config")
+            text = "Tapped Play: shell game"
+        else:
+            if slot not in ("left", "middle", "right"):
+                raise ValueError("pick left, middle or right")
+            if self._game["stage"] != "guess":
+                raise ValueError("the cups aren't ready for a guess")
+            cmd = next((c for c in self.commands if c["action"] == "shell_game_guess"), None) or self._mk_cmd(
+                action="shell_game_guess", label="Guessing the cup", resource_name=self._shell_arm or "")
+            text = f"Tapped the {slot} cup"
+        label = self._label(cmd)
+        LOGGER.info(f"status page: {text}")
+        return self._launch(cmd, text, label, typed=True)
+
+    async def _shell_kill(self) -> None:
+        """Interrupt a running game step: Ctrl+C to its whole process group (its scripts ask the arm to
+        stop), then kill it if it hasn't ended a few seconds later."""
+        proc = self._shell_proc
+        if proc is None or proc.returncode is not None:
+            return
+        for sig, wait in ((signal.SIGINT, 6.0), (signal.SIGKILL, 2.0)):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, sig)
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), wait)
+                break
+            except asyncio.TimeoutError:
+                continue
+        LOGGER.info("shell game: interrupted")
+
     # ---------- vision: looking, calibration, grabbing ----------
     # Every arm that can grab has its own camera calibration. A block (or an object clicked on the
     # status page) is grabbed by the calibrated arm closest to it that can reach it.
@@ -1588,8 +1895,13 @@ class VoiceRouter(Generic, EasyResource):
                       and (not self.picker or g["key"] == self.picker)]
         if not calibrated:
             if self.picker:
-                p = self.grabbers[self.picker]["name"]
-                return None, f"{p} can only grab what its own camera sees: switch to {_cap(p)}"
+                g = self.grabbers[self.picker]
+                link = g["table_link"]
+                have = len(link.points)
+                return None, (f"{g['name']} can only grab what its own camera sees so far: switch to {_cap(g['name'])}, "
+                              f"or leave a few blocks where both cameras see them to link the table camera to it "
+                              f"({have} of {link.MIN_POINTS} shared points so far"
+                              + (f"; {link.warning}" if link.warning else "") + ")")
             return None, "no arm is calibrated to the camera yet (see Setup)"
         options = []
         for g in calibrated:
@@ -1654,12 +1966,13 @@ class VoiceRouter(Generic, EasyResource):
         base = _ov_matrix(pose.o_x, pose.o_y, pose.o_z, pose.theta) @ in_flange + np.array([pose.x, pose.y, pose.z])
         return [float(x) for x in base]
 
-    def _wrist_target_problem(self, g: Dict[str, Any], p: List[float]) -> Optional[str]:
-        """Why arm `g` shouldn't go for a point found with its wrist camera (None = fine)."""
+    def _wrist_target_problem(self, g: Dict[str, Any], p: List[float],
+                              src: str = "the camera's mounting") -> Optional[str]:
+        """Why arm `g` shouldn't go for a point found with its wrist camera, or handed over by the table
+        camera's link (`src` names which; None = fine)."""
         v = self.vision
         if not (v["table_z_mm"] - 60 <= p[2] <= v["table_z_mm"] + 450):
-            return (f"the camera's mounting doesn't add up: it puts this {p[2] - v['table_z_mm']:.0f} mm "
-                    "from the table")
+            return f"{src} doesn't add up: it puts this {p[2] - v['table_z_mm']:.0f} mm from the table"
         if not v["reach_min_mm"] <= math.hypot(p[0], p[1]) <= v["reach_max_mm"]:
             return f"it's out of {g['name']}'s reach"
         if g["holding"]:
@@ -1669,6 +1982,165 @@ class VoiceRouter(Generic, EasyResource):
     def _picker_cam(self) -> Optional[Dict[str, Any]]:
         return next((c for c in getattr(self, "live_cams", []) if self.picker and c.get("arm") == self.picker
                      and c["cam"] is not None and c["arm_res"] is not None), None)
+
+    def _desk_cam(self) -> Optional[Dict[str, Any]]:
+        """The table camera's live feed (the camera the arms are calibrated to), if it's shown."""
+        if not self.vision:
+            return None
+        return next((d for d in getattr(self, "live_cams", []) if not d.get("arm") and d["cam"] is not None
+                     and d["camera"] == self.vision["camera_name"]), None)
+
+    # ---------- linking the table camera to the picker ----------
+    # The picker's wrist camera places what it sees in the arm's base frame (the camera's mounting and the
+    # arm's pose are known), but only sees what's under it. The table camera sees the whole table but knows
+    # nothing about the arm. Whenever both see the same thing at the same moment while the arm is still,
+    # that's one point pairing "where the table camera sees it" with "where it is for the arm". From a few
+    # such points spread over the table a rigid transform follows (same maths as the block calibration),
+    # and the table camera can then hand the arm things its own camera can't see — a can standing behind
+    # it, say. The points are kept in table_link.<arm>.json, so the link survives restarts; a thing that
+    # moved between the two pictures shows up as a point that doesn't fit the rest and is dropped.
+
+    LINK_MAX_POINTS = 24
+
+    def _link_grabber(self, c: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The arm the table camera `c` can hand things to through its learned link (None if no link yet)."""
+        if c is None or not self.picker or not self.vision or c.get("arm") or c["camera"] != self.vision["camera_name"]:
+            return None
+        g = self.grabbers.get(self.picker)
+        return g if g is not None and g["table_link"].ready else None
+
+    def _learn_link(self, c: Dict[str, Any], objs: List[Dict[str, Any]], pose) -> None:
+        """A wrist camera `c` just saw `objs` with its arm at `pose`: if it's the picker's, and the table
+        camera has a picture from the same moment, pair the things both can see."""
+        try:
+            if not self.picker or c.get("arm") != self.picker or pose is None:
+                return
+            g, desk = self.grabbers.get(self.picker), self._desk_cam()
+            if g is None or desk is None or desk["camera"] == c["camera"]:
+                return
+            if time.time() - self._det_at.get(desk["camera"], 0.0) > 1.2:
+                return                                   # the table camera's view isn't from the same moment
+            if (getattr(self, "_arm_state", {}).get(c["arm"]) or {}).get("moving"):
+                return                                   # mid-move: the picture and the pose don't line up
+            if self._action_task is not None and not self._action_task.done() and c["arm"] in self._action_arms:
+                return
+            if time.time() - g["_link_t"] < 1.0:
+                return
+            desk_objs = list(status_page.live_status(desk["camera"]).get("objects") or [])
+            pairs = self._match_views(desk_objs, desk, objs, c, pose)
+            if pairs:
+                g["_link_t"] = time.time()
+                self._link_add(g, pairs)
+        except Exception as e:                            # never let bookkeeping break the camera loop
+            LOGGER.debug(f"table link: {_friendly_error(e)}")
+
+    def _match_views(self, desk_objs: List[Dict[str, Any]], desk: Dict[str, Any],
+                     wrist_objs: List[Dict[str, Any]], c: Dict[str, Any], pose) -> List[Tuple[List[float], List[float], str]]:
+        """Things seen by both the table camera and wrist camera `c` at once, as (table-camera point,
+        point in the arm's base frame, color). Only a color that appears exactly once in each view is
+        matched, and only flat things (the two cameras see different parts of a tall one: its top from
+        above, its near side from the table camera)."""
+        v = self.vision
+
+        def key(o):
+            return (o.get("block") or o.get("color") or "").lower()
+
+        def flat(o):
+            h = float((o.get("size_mm") or [0, 0, 0])[2] or 0)
+            return not o.get("tall") and 0 < h <= 60
+
+        by_d: Dict[str, List[Dict[str, Any]]] = {}
+        by_w: Dict[str, List[Dict[str, Any]]] = {}
+        for o in desk_objs:
+            by_d.setdefault(key(o), []).append(o)
+        for o in wrist_objs:
+            by_w.setdefault(key(o), []).append(o)
+        pairs = []
+        for k, ds in by_d.items():
+            ws = by_w.get(k) or []
+            if not k or len(ds) != 1 or len(ws) != 1:
+                continue
+            d, w = ds[0], ws[0]
+            if not flat(d) or not flat(w):
+                continue
+            sd, sw = d["size_mm"], w["size_mm"]
+            if abs(sd[2] - sw[2]) > 20 or abs(max(sd[0], sd[1]) - max(sw[0], sw[1])) > 35:
+                continue                                 # not the same kind of thing
+            cam, wc = self._object_cam_mm(d, desk), self._object_cam_mm(w, c)
+            if cam is None or wc is None:
+                continue
+            base = self._wrist_to_base(c, wc, pose)
+            if not (v["table_z_mm"] - 40 <= base[2] <= v["table_z_mm"] + 250):
+                continue                                 # the wrist reading is off; don't learn from it
+            pairs.append(([float(x) for x in cam], [float(x) for x in base], k))
+        return pairs
+
+    def _link_add(self, g: Dict[str, Any], pairs: List[Tuple[List[float], List[float], str]]) -> None:
+        """Fold freshly matched points into arm `g`'s table link: a point already known is skipped, one
+        near where a known point was (the thing moved) replaces it, and after solving, a point that
+        doesn't fit the rest is dropped."""
+        link = g["table_link"]
+        was = link.ready
+        changed, added = False, 0
+        for cam, base, color in pairs:
+            keep, dup = [], False
+            for p in link.points:
+                dc = math.dist(p["cam"], cam)
+                db = math.dist([p["arm"]["x"], p["arm"]["y"], p["arm"]["z"]], base)
+                if dc < 25 and db < 25:
+                    dup = True
+                    keep.append(p)                       # the same thing in the same place: have it already
+                elif dc < 25 or db < 25:
+                    # the same spot in one camera now pairs with somewhere else in the other: the thing
+                    # moved between the two pictures (or the colors got mixed up) — the old point is stale.
+                    # (Two different things close together differ in both frames, so both are kept.)
+                    changed = True
+                else:
+                    keep.append(p)
+            if not dup:
+                keep.append({"cam": cam, "arm": {"x": base[0], "y": base[1], "z": base[2],
+                                                 "o_x": 0.0, "o_y": 0.0, "o_z": -1.0, "theta": 0.0},
+                             "color": color, "t": time.time()})
+                changed, added = True, added + 1
+            link.points = keep[-self.LINK_MAX_POINTS:]
+        if not changed:
+            return
+        link.save()
+        link.solve()
+        while link.R is not None and (link.rms_mm or 0) > 15 and len(link.points) > link.MIN_POINTS + 1:
+            worst = max(range(len(link.points)), key=lambda i: link.per_point_mm[i])
+            if link.per_point_mm[worst] < 25:
+                break
+            del link.points[worst]
+            link.save()
+            link.solve()
+        name = _cap(g["name"])
+        if link.ready and not was:
+            LOGGER.info(f"{name}: the table camera is linked to it ({len(link.points)} shared points, "
+                        f"±{link.rms_mm} mm) — it can now grab what the table camera sees")
+        elif was and not link.ready:
+            LOGGER.warning(f"{name}: the table camera link no longer fits ({link.warning}); re-learning it")
+        elif added:
+            LOGGER.info(f"{name}: table link has {len(link.points)} shared points"
+                        + (f", ±{link.rms_mm} mm" if link.rms_mm is not None else
+                           f" (needs {link.MIN_POINTS}, spread over the table)"))
+
+    def _link_target(self, g: Dict[str, Any], obj: Dict[str, Any], c: Dict[str, Any]) \
+            -> Tuple[Optional[List[float]], Dict[str, Any], str]:
+        """Where arm `g` finds the thing the table camera `c` sees, through its link: the top centre in
+        the arm's base frame, plus how tall it is and which way it lies (for the gripper)."""
+        import numpy as np
+        link = g["table_link"]
+        cam = self._object_cam_mm(obj, c)
+        if cam is None:
+            return None, {}, "no distance reading for it"
+        top = link.to_arm(cam)
+        extras: Dict[str, Any] = {"axis": None, "height": float((obj.get("size_mm") or [0, 0, 0])[2] or 0)}
+        if obj.get("axis_cam"):
+            d = link.R @ np.array(obj["axis_cam"], float)
+            if math.hypot(d[0], d[1]) > 0.3:
+                extras["axis"] = [float(d[0]), float(d[1])]
+        return top, extras, ""
 
     def _in_action_task(self) -> bool:
         """True when called from the running action itself (False from the page's thread)."""
@@ -1713,6 +2185,17 @@ class VoiceRouter(Generic, EasyResource):
             return {"why": "no distance reading for it"}
         if across > MAX_GRIP_MM:
             return {"why": f"where it would be gripped it's about {round(across / 10)} cm across, too wide for the gripper"}
+        lg = self._link_grabber(c)
+        if lg is not None:
+            # the table camera hands it to the picker through the learned link: the arm goes to its top
+            # centre and grips partway down, the same way it grabs what its own wrist camera sees
+            p, extras, why = self._link_target(lg, obj, c)
+            if p is None:
+                return {"why": why}
+            why = self._wrist_target_problem(lg, p, "the table camera's link")
+            if why:
+                return {"why": why}
+            return {"arm": lg["name"], "key": lg["key"], "via": "link"}
         g, res = self._closest_arm(cam)
         if g is None:
             return {"why": res}
@@ -1846,22 +2329,17 @@ class VoiceRouter(Generic, EasyResource):
         return await self._pick(self.grabbers[ch["arm_key"]], ch["cam_mm"], f"{color} block")
 
     async def _squeeze(self, g: Dict[str, Any]) -> bool:
-        """Close the gripper on something; True if it's holding it. With grip_force set, the UFactory G2
-        gripper closes with that much force (a gentler squeeze than its default)."""
+        """Close the gripper on something; True if it's holding it. Gentle, the way arm 18 grips the cups in
+        the shell game (src/grip.py): torque-limited (grip_force_pct, default 10), jaws at a moderate speed,
+        stopping as soon as they stall on the thing, then a check once the jaws have settled."""
         gripper = g["gripper"]
-        force = g.get("grip_force")
-        if force and not g.get("force_unsupported"):
-            try:
-                await gripper.do_command({"grab_with_torque": {"position": 0.0, "speed": 2000.0, "torque": float(force)}})
-                await asyncio.sleep(0.2)
-                hs = await gripper.is_holding_something()
-                return bool(getattr(hs, "is_holding_something", False))
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                g["force_unsupported"] = True
-                LOGGER.warning(f"{_cap(g['name'])}'s gripper doesn't take a grip force ({_friendly_error(e)}); "
-                               "using its normal grab")
+        if not g.get("force_unsupported"):
+            held = await grip.gentle_close(gripper, torque=float(g.get("grip_force") or grip.TORQUE), arm=g["arm"])
+            if held is not None:
+                return held
+            g["force_unsupported"] = True
+            LOGGER.warning(f"{_cap(g['name'])}'s gripper doesn't take a gentle (torque-limited) close; "
+                           "using its normal grab")
         return await gripper.grab()
 
     @contextlib.asynccontextmanager
@@ -1910,6 +2388,7 @@ class VoiceRouter(Generic, EasyResource):
             was = "" if g["holding"] == "something" else f": no longer holding the {g['holding']}"
             LOGGER.info(f"{_cap(g['name'])}'s gripper is empty now{was}")
             g["holding"] = None
+            self._remember_pick(g, None)
         elif holding and not g["holding"]:
             LOGGER.info(f"{_cap(g['name'])}'s gripper is holding something")
             g["holding"] = "something"
@@ -2008,9 +2487,19 @@ class VoiceRouter(Generic, EasyResource):
         objs = await self._fresh_objects(c)
         best, why = self._pick_object(objs, c, color, noun, which)
         if best is None:
+            note = ""
+            if not why:
+                # the wrist camera only sees what's under it: ask the table camera, which sees the whole
+                # table and can hand the thing over once it's linked to this arm
+                done, note = await self._grab_via_table(g, c, color, noun, which, what)
+                if done is not None:
+                    return done
             if color and noun in (None, "block") and not why:   # nothing named: a plain color search
-                return await self._grab_with_wrist(c, color)
-            raise NotFound(_cap(why or f"{name} can't see a {what} from where it is"))
+                try:
+                    return await self._grab_with_wrist(c, color)
+                except NotFound as e:
+                    raise NotFound(f"{e}{note}")
+            raise NotFound(_cap(why or f"{name} can't see a {what} from where it is{note}"))
         p, why = self._wrist_point(best, c)
         if p is None:
             raise ValueError(why)
@@ -2041,7 +2530,45 @@ class VoiceRouter(Generic, EasyResource):
                 raise ValueError(why)
             return await self._pick_at(g, p, what, float((obj.get("size_mm") or [0, 0, 0])[2] or 0),
                                        self._wrist_extras(obj, c))
+        if info.get("via") == "link":
+            p, extras, why = self._link_target(g, obj, c)
+            if p is None:
+                raise ValueError(why)
+            return await self._pick_at(g, p, what, extras["height"], extras)
         return await self._pick(g, self._object_cam_mm(obj, c), what)
+
+    async def _grab_via_table(self, g: Dict[str, Any], c: Dict[str, Any], color: Optional[str], noun: Optional[str],
+                              which: Optional[int], what: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Arm `g`'s wrist camera `c` doesn't see the thing: look through the table camera. If it sees the
+        thing and is linked to the arm, the arm grabs it that way. Otherwise (None, a note for the "can't
+        see it" message saying what the table camera made of it)."""
+        desk = self._desk_cam()
+        if desk is None or desk["camera"] == c["camera"]:
+            return None, ""
+        objs = await self._fresh_objects(desk)
+        link = g["table_link"]
+        if not link.ready:
+            # no link yet (or it fell apart): pair what both cameras see right now, in case that's enough
+            pose = (self._live_last.get(c["camera"]) or {}).get("pose")
+            wrist_objs = list(status_page.live_status(c["camera"]).get("objects") or [])
+            if pose is not None and wrist_objs:
+                pairs = self._match_views(objs, desk, wrist_objs, c, pose)
+                if pairs:
+                    self._link_add(g, pairs)
+        if not link.ready:
+            sees = any(not color or color == (o.get("block") or o.get("color") or "").lower()
+                       or color in (o.get("label") or "").lower().split() for o in objs)
+            if not sees:
+                return None, ""
+            return None, (f"; the table camera sees it, but isn't linked to {g['name']} yet — leave a few blocks "
+                          f"where both cameras can see them ({len(link.points)} of {link.MIN_POINTS} shared points so far)")
+        best, why = self._pick_object(objs, desk, color, noun, which)
+        if best is None:
+            return None, (f"; the table camera {why}" if why else "; the table camera doesn't see one either")
+        tag = best.get("tag") or best["label"]
+        label = tag[:1].lower() + tag[1:]
+        LOGGER.info(f"“{what}” -> the {label} in {desk['label']}, handed to {g['name']} through the table link")
+        return await self._grab_seen(best, desk, label), ""
 
     async def _grab_with_wrist(self, c: Dict[str, Any], color: str) -> Dict[str, Any]:
         g = self.grabbers[c["arm"]]
@@ -2102,6 +2629,9 @@ class VoiceRouter(Generic, EasyResource):
             p, _ = self._wrist_point(obj, c)
             height = float((obj.get("size_mm") or [0, 0, 0])[2] or 0)
             pick, kind = (g, p, what, height, self._wrist_extras(obj, c)), "wrist"
+        elif info.get("via") == "link":   # the table camera hands it to the picker: same grab as from the wrist
+            p, extras, _ = self._link_target(g, obj, c)
+            pick, kind = (g, p, what, extras["height"], extras), "wrist"
         else:
             pick, kind = (g, self._object_cam_mm(obj, c), what), "table"
         label = f"Grabbed with {g['name']}"
@@ -2204,6 +2734,8 @@ class VoiceRouter(Generic, EasyResource):
             raise ValueError(f"{name} missed the {what}: the gripper closed on nothing "
                              "(calibration may be off; check the status page snapshot)")
         g["holding"] = what
+        self._remember_pick(g, {"what": what, "x": target[0], "y": target[1], "grip_z": None, "xa": None,
+                                "flange": {"x": target[0], "y": target[1], "z": target[2], **o}, "t": time.time()})
 
         # bring it to this arm's hand-off spot if one is taught, otherwise hold it up here
         handoff = self._poses.get(self._handoff_key(g))
@@ -2384,6 +2916,9 @@ class VoiceRouter(Generic, EasyResource):
             await gripper.open()
             raise ValueError(f"{name} missed the {what}: the gripper closed on nothing")
         g["holding"] = what
+        f = flange(grip_z)
+        self._remember_pick(g, {"what": what, "x": x, "y": y, "grip_z": reach, "xa": None, "t": time.time(),
+                                "flange": {k: getattr(f, k) for k in ("x", "y", "z", "o_x", "o_y", "o_z", "theta")}})
 
         handoff = self._poses.get(self._handoff_key(g))
         if handoff:
@@ -2462,6 +2997,8 @@ class VoiceRouter(Generic, EasyResource):
             await gripper.open()
             raise ValueError(f"{name} missed the {what}: the gripper closed on nothing")
         g["holding"] = what
+        self._remember_pick(g, {"what": what, "x": x, "y": y, "grip_z": float(grip_z),
+                                "xa": [float(xa[0]), float(xa[1])], "flange": None, "t": time.time()})
         handoff = self._poses.get(self._handoff_key(g))
         if handoff:
             self._set_phase("running", current=f"{name} is bringing you the {what}")
@@ -2480,8 +3017,162 @@ class VoiceRouter(Generic, EasyResource):
         held = [g["holding"] for g in holders]
         for g in holders:
             g["holding"] = None
+            self._remember_pick(g, None)   # let go wherever it is: it's not where it came from any more
         self._current = ("Let go of the " + " and the ".join(held)) if held else "Gripper opened"
         return {"released": held}
+
+    # ---------- putting something back ("put it back down") ----------
+
+    async def _put_back(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
+        """Take what arm `g` is holding back to where it picked it up, set it down there (the fingers come
+        down to where they gripped it, so it ends up resting on the table as before), let go, rise, and go
+        back to the starting position. "Stop" leaves the arm where it halted, still holding it."""
+        g = self.grabbers.get(cmd["resource_name"]) or self._grabber(cmd.get("name") or "")
+        name = _cap(g["name"])
+        if g["arm"] is None or g["gripper"] is None:
+            raise ValueError(f"{name} or its gripper isn't available (is its machine online?)")
+        await self._sync_holding(g)
+        if not g["holding"]:
+            raise NotFound(f"{name} isn't holding anything to put down")
+        spot = self._picked_from(g)
+        held = g["holding"] if g["holding"] != "something" else (spot or {}).get("what") or "thing it's holding"
+        if not spot:
+            raise NotFound(f"I don't know where {name} got the {held} from — say “let go” to open the gripper "
+                           "where it is")
+        self._action_arms = [g["key"]]
+        async with self._pick_motion(g):
+            self._set_phase("running", current=f"{name} is putting the {held} back")
+            self._stage = "reach"
+            if not await self._place_straight(g, spot, held):
+                await self._place_planned(g, spot, held)
+            g["holding"] = None
+            self._remember_pick(g, None)
+            self._stage = "return"
+            self._set_phase("running", current=f"{name} is going back to the start")
+            try:
+                await self._return_home(g)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:   # it's put down already: say so, but don't call the whole thing failed
+                LOGGER.warning(f"{name} put the {held} back but couldn't go to its starting position: "
+                               f"{_friendly_error(e)}")
+        self._current = f"Put the {held} back"
+        return {"put_back": held, "arm": g["name"], "at": [spot["x"], spot["y"]]}
+
+    def _picked_from(self, g: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Where arm `g` picked up what it's holding (kept on disk, so it's known after a restart)."""
+        return g.get("picked_from") or (getattr(self, "_poses", {}) or {}).get("picked:" + g["key"])
+
+    def _remember_pick(self, g: Dict[str, Any], spot: Optional[Dict[str, Any]]) -> None:
+        """Note (or, with None, forget) where arm `g` picked up what it's holding, in memory and on disk."""
+        g["picked_from"] = spot
+        poses = getattr(self, "_poses", None)
+        if poses is None:
+            return
+        key = "picked:" + g["key"]
+        if spot is None and key not in poses:
+            return
+        if spot is None:
+            poses.pop(key, None)
+        else:
+            poses[key] = spot
+        try:
+            _save_poses(poses)
+        except Exception as e:
+            LOGGER.warning(f"couldn't save where {g['name']} picked up the {(spot or {}).get('what', 'thing')}: {e}")
+
+    async def _place_straight(self, g: Dict[str, Any], spot: Dict[str, Any], held: str) -> bool:
+        """Put-back with straight-line moves worked out here (no motion planner), the same way the grab
+        went in: over the spot, wrist turned as it was, straight down, open, straight up. False (nothing
+        moved) if this pick wasn't a wrist pick or a straight path can't be found."""
+        import numpy as np
+        if spot.get("grip_z") is None:
+            return False
+        v = self.vision
+        arm, gripper, name = g["arm"], g["gripper"], _cap(g["name"])
+        q0 = await self._ik_ready(g)
+        if q0 is None:
+            return False
+        tcp = v["finger_mm"]
+        x, y = spot["x"], spot["y"]
+        place_z = spot["grip_z"] + 4.0           # a hair higher than it was gripped: set down, not pushed down
+        cur = kin.fk(q0)
+        xa = np.array([*(spot.get("xa") or [cur[0, 0], cur[1, 0]]), 0.0])
+        if np.linalg.norm(xa) < 0.3:
+            xa = np.array([1.0, 0.0, 0.0])
+        xa /= np.linalg.norm(xa)
+        above_z = place_z + v["approach_mm"] + tcp
+        T_above = kin.pose_down(x, y, above_z, xa)
+        T_place = kin.pose_down(x, y, place_z + tcp, xa)
+
+        def plan():
+            pts, q = [], q0
+            if cur[2, 2] > -0.9 or math.hypot(cur[0, 3] - x, cur[1, 3] - y) > 450:
+                return None, None, None
+            if cur[2, 3] < above_z - 5:
+                rise = kin.line(q, np.vstack([np.column_stack([cur[:3, :3], [cur[0, 3], cur[1, 3], above_z]]),
+                                              [0, 0, 0, 1]]))
+                if rise is None:
+                    return None, None, None
+                pts += rise
+                q = rise[-1]
+            travel = kin.line(q, T_above, step_mm=35.0, step_deg=10.0) or kin.line(q, T_above)
+            if travel is None:
+                return None, None, None
+            pts += travel
+            down = kin.line(travel[-1], T_place, step_mm=10)
+            if down is None:
+                return None, None, None
+            up = kin.line(down[-1], T_above)
+            return pts, down, up
+
+        travel, down, up = await asyncio.to_thread(plan)
+        if up is None:
+            LOGGER.info(f"{name}: no straight path back to where the {held} was; using the motion planner")
+            return False
+        LOGGER.info(f"{name}: putting the {held} back at ({x:.0f}, {y:.0f}); fingertips to z={place_z:.0f} "
+                    "— straight moves, no planner")
+        await self._move_line(arm, travel, self._travel_speed())
+        self._stage = "place"
+        self._set_phase("running", current=f"{name} is setting the {held} down")
+        await self._move_line(arm, down, self._approach_speed())
+        await gripper.open()
+        await asyncio.sleep(0.3)
+        self._stage = "lift"
+        await self._move_line(arm, up, self._approach_speed())
+        return True
+
+    async def _place_planned(self, g: Dict[str, Any], spot: Dict[str, Any], held: str) -> None:
+        """Put-back through the motion planner: above the spot, down to where it was gripped, open, up."""
+        v = self.vision
+        arm, gripper, name = g["arm"], g["gripper"], _cap(g["name"])
+        here = await arm.get_end_position()
+        f = spot.get("flange")
+        if f:
+            orient = {k: f[k] for k in ("o_x", "o_y", "o_z", "theta")}
+            place = f["z"] + 4.0
+        else:
+            orient = {"o_x": 0.0, "o_y": 0.0, "o_z": -1.0, "theta": here.theta if here.o_z < -0.8 else 0.0}
+            place = max(spot["grip_z"] + 4.0 + v["finger_mm"], v["table_z_mm"] + 6 + v["planner_finger_mm"])
+        above = place + v["approach_mm"]
+        if v.get("safe_z_mm") is not None:
+            above = max(above, float(v["safe_z_mm"]))
+
+        def pose(z):
+            return Pose(x=spot["x"], y=spot["y"], z=z, **orient)
+
+        LOGGER.info(f"{name}: putting the {held} back at ({spot['x']:.0f}, {spot['y']:.0f}) with the motion planner")
+        if here.z < above - 5:
+            await arm.move_to_position(Pose(x=here.x, y=here.y, z=above, o_x=here.o_x, o_y=here.o_y,
+                                            o_z=here.o_z, theta=here.theta))
+        await arm.move_to_position(pose(above))
+        self._stage = "place"
+        self._set_phase("running", current=f"{name} is setting the {held} down")
+        await arm.move_to_position(pose(place))
+        await gripper.open()
+        await asyncio.sleep(0.3)
+        self._stage = "lift"
+        await arm.move_to_position(pose(above))
 
     # ---------- starting position ("reset arm seventeen") ----------
 
@@ -2583,6 +3274,9 @@ class VoiceRouter(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         if "simulate" in command:
             return await self._route(str(command["simulate"]), typed=True)
+        fr = await features.do_command(self, dict(command))
+        if fr is not None:
+            return fr
         if "status" in command:
             snap = self._snapshot()
             snap.pop("history", None)
@@ -2601,12 +3295,25 @@ class VoiceRouter(Generic, EasyResource):
             v = command["mic"]
             return self._set_mic((not _MIC["on"]) if v == "toggle" else bool(v))
         if "save_live_frame" in command:   # debugging aid: dump the latest live frame next to the module
-            out, intr = getattr(self, "_last_live", (None, None))
-            if not out or out["depth_mm"] is None:
-                return {"error": "no live frame yet (open the status page)"}
             import numpy as np
             path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 f"debug_frame_{command['save_live_frame']}.npz")
+            want = str(command.get("camera") or "")
+            c = next((x for x in getattr(self, "live_cams", []) if x["camera"] == want), None) if want else None
+            if c is not None:   # {"save_live_frame": "x", "camera": "arm17-cam"}: a fresh frame from that camera
+                res = await asyncio.wait_for(c["cam"].get_images(), timeout=10)
+                named = res[0] if isinstance(res, tuple) else res
+                img, depth = await asyncio.to_thread(vision.split_images, named)
+                p = (await c["cam"].get_properties()).intrinsic_parameters
+                pose = await c["arm_res"].get_end_position() if c.get("arm_res") is not None else None
+                np.savez_compressed(path, depth=depth, rgb=np.asarray(img.convert("RGB")),
+                                    intr=np.array([p.focal_x_px, p.focal_y_px, p.center_x_px, p.center_y_px]),
+                                    pose=np.array([pose.x, pose.y, pose.z, pose.o_x, pose.o_y, pose.o_z, pose.theta])
+                                    if pose is not None else np.array([]))
+                return {"saved": path, "camera": want}
+            out, intr = getattr(self, "_last_live", (None, None))
+            if not out or out["depth_mm"] is None:
+                return {"error": "no live frame yet (open the status page)"}
             np.savez_compressed(path, depth=out["depth_mm"], color=np.frombuffer(out["color"] or b"", np.uint8),
                                 intr=np.array([intr[k] for k in ("fx", "fy", "cx", "cy")] if intr else []))
             return {"saved": path}
@@ -2634,6 +3341,8 @@ class VoiceRouter(Generic, EasyResource):
                          "calibration, calib_record"}
 
     async def close(self):
+        if getattr(self, "_shell_proc", None) is not None:
+            await self._shell_kill()
         for t in (getattr(self, "_task", None), getattr(self, "_action_task", None),
                   getattr(self, "_level_task", None), getattr(self, "_arms_task", None),
                   *getattr(self, "_live_tasks", [])):
